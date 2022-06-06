@@ -1,0 +1,421 @@
+---
+title: "Data construction: Crop suitability"
+author: "Dr. Emily Burchfield"
+output: html_document
+---
+
+This document describes the data and scripts used to construct the presence/absence panels used to calibrate historical crop suitability models and project future suitability.  We define each crop's presence/absense using the following categories from the [USDA Cropland Data Layer](https://nassgeodata.gmu.edu/CropScape/):
+
+* **Corn**: Corn (1), Dbl Crop WinWht/Corn (225), Dbl Crop Oats/Corn (226), Dbl Crop Triticale/Corn (228), Dbl Crop Barley/Corn (237), DblCrop Corn/Soybeans (241)^[Note, dropped Sweet Corn and Popcorn since this was not included in the National Crop Frequency Layer.]
+* **Winter wheat**: Winter wheat (24), Dbl Crop WinWht/Corn (225), Dbl Crop WinWht/Sorghum (236), Dbl Crop WinWht/Cotton (238), DblCrop Winwht/Soybeans (26) 
+* **Soybeans**: Soybeans (5), DblCrop Soybeans/Cotton (239), DblCrop Soybeans/Oats (240), DblCrop Corn/Soybeans (241), DblCrop Winwht/Soybeans (26), DblCrop Barley/Soybeans (254)
+* **Cotton**: Cotton (2), Dbl Crop Lettuce/Cotton (232), Dbl Crop WinWht/Cotton (238), Dbl Crop Soybeans/Cotton (239)
+* **Spring wheat**: Spring wheat (23)
+* **Alfalfa**: Alfalfa (36), 
+* **Hay**: Other hay/non-alfalfa (37)
+ 
+```{r message=F, warning=F, echo=F, results="hide"}
+library(sp)
+library(tidyverse)
+library(raster)
+library(rgdal)
+library(rasterVis)
+library(spdplyr)
+library(sf)
+library(velox)
+select <- dplyr::select
+
+source("CS_load.R")
+source("CS_func.R")
+```
+
+## Biophysical suitability analyses {.tabset .tabset-fade}
+
+### ROI
+
+Our region of interest includes the following states: 
+
+`r unique(states$STATE_NAME)`
+
+```{r echo=F}
+states$area <- st_area(states)
+roi <- states %>% summarise(area = sum(area))
+
+# ggplot(roi) + geom_sf()
+ggplot(states) + geom_sf() + theme_minimal()
+
+# st_write(roi, "./out/roi.shp")
+# st_write(states, "./out/states.shp")
+```
+
+### Presence/absence data
+
+* `Presence`:  The crop was planted in this pixels more than twice from 2008 to 2019.
+* `Absence`: The crop was *never* planted in this pixel from 2008 to 2019.
+
+```{r eval=F}
+#  Build crop frequency shapefiles
+
+# generate random points in ROI
+set.seed(300)
+rpt <- st_as_sf(spsample(roi, n = 2500000, "random")) # big n needed to ensure 10K AP for each crop
+
+state_names <- unique(states$STATE_NAME)
+num_cores <- detectCores() - 3
+clus <- makeCluster(num_cores)
+registerDoParallel(clus)
+out <- build_freq_points(num_cores, state_names) # see CS_func.R
+stopCluster(clus)
+
+# frequency count through time
+ap <- st_set_geometry(out %>% select(contains("x")), NULL)
+
+fdf <- list()
+for (i in 1:length(crop_dc_list)) {
+  vls <- crop_dc_list[[i]]
+  makec <- function(r) paste('ap==', r, '|')
+  stmt <- paste((unlist(lapply(vls, FUN = makec))), collapse='')
+  stmt <- substr(stmt, 1, nchar(stmt)-1)
+  fdf[[i]] <- as.vector(rowSums(eval(parse(text=stmt)), na.rm=T))
+}
+fdf <- do.call("cbind.data.frame", fdf)
+colnames(fdf) <- crop_names
+final <- st_as_sf(cbind.data.frame(out, fdf))
+
+# remove weak presence rows
+corn <- final %>% filter(!Corn %in% c(1:2))
+cotton <- final %>% filter(!Cotton %in% c(1:2))
+soy <- final %>% filter(!Soy %in% c(1:2))
+swheat <- final %>% filter(!Swheat %in% c(1:2))
+wwheat <- final %>% filter(!Wwheat %in% c(1:2))
+alfalfa <- final %>% filter(!Alfalfa %in% c(1:2))
+hay <- final %>% filter(!Hay %in% c(1:2))
+freq <- list(corn, cotton, soy, swheat, wwheat, alfalfa, hay)
+
+n <- 10000
+for (i in 1:length(freq)) {
+  df <- as.data.frame(freq[i])
+  a <- df %>% filter(!!as.symbol(crop_names[i]) == 0)
+  a <- a[sample(nrow(a), n), ]
+  a$TYPE <- 0
+  p <- df %>% filter(!!as.symbol(crop_names[i]) > 0)
+  p <- p[sample(nrow(p), n), ]
+  p$TYPE <- 1
+  f <- rbind.data.frame(a, p)
+  print(paste0(crop_names[i], nrow(f)))
+  saveRDS(f, paste0("./out/", crop_names[i], "_AP.RDS")) 
+}
+
+#  Merge into single shapefile
+corn <- clean_AP_data("Corn") # CS_func.R
+corn$CROP <- "CORN"
+cotton <- clean_AP_data("Cotton")
+cotton$CROP <- "COTTON"
+soy <- clean_AP_data("Soy")
+soy$CROP <- "SOY"
+swheat <- clean_AP_data("Swheat")
+swheat$CROP <- "SWHEAT"
+wwheat <- clean_AP_data("Wwheat")
+wwheat$CROP <- "WWHEAT"
+alfalfa <- clean_AP_data("Alfalfa")
+alfalfa$CROP <- "ALFALFA"
+hay <- clean_AP_data("Hay")
+hay$CROP <- "HAY"
+ap <- rbind.data.frame(corn, cotton, soy, swheat, wwheat, alfalfa, hay)
+ap$FID <- as.numeric(1:nrow(ap))
+saveRDS(ap, "./out/ap.RDS")
+```
+
+Randomly subset 10000 of presence pixels and absence pixels across the ROI.
+
+```{r eval=F, echo=F}
+# lots of points
+ap <- readRDS("./out/ap.RDS")
+ggplot(data = roi) +
+  geom_sf(color = "black", fill = "lightgreen") +
+  theme_bw() +
+  ggtitle("Absence/presence points") +
+  geom_sf(data = ap)
+```
+
+### Predictors
+
+#### Climate 
+
+**Historical weather** data came from the Daymet team, the [Monthly Climate Summaries on a 1-km Grid for North America, V. 3](https://daac.ornl.gov/cgi-bin/dsviewer.pl?ds_id=1345). Precipitation is in `mm/day`, min and maximum air temperature are `degrees C`.
+
+* Thornton, M.M., P.E. Thornton, Y. Wei, B.W. Mayer, R.B. Cook, and R.S. Vose. 2016. Daymet: Monthly Climate Summaries on a 1-km Grid for North America, Version 3. ORNL DAAC, Oak Ridge, Tennessee, USA. https://doi.org/10.3334/ORNLDAAC/1345
+
+From the annual stacks of this monthly data, I computed the `biovars` variables from the `dismo` package (see full list and description [here](https://www.worldclim.org/data/bioclim.html)).  This makes sense because these are also easily available in the future climate projections provided by the WorldClim group.
+
+```{r eval=F}
+#  Extract DayMet
+
+# (after running daymet_download.R)
+
+library(dismo)
+library(sf)
+
+years <- 1999:2019
+
+pptf <- Sys.glob("C:/Users/eburchf/OneDrive - Emory University/Data/DayMet/prcp_monttl_*")
+tminf <- Sys.glob("C:/Users/eburchf/OneDrive - Emory University/Data/DayMet/tmin_monavg*")
+tmaxf <- Sys.glob("C:/Users/eburchf/OneDrive - Emory University/Data/DayMet/tmax_monavg*")
+
+for (i in 1:length(years)) {
+  print(years[i])
+  dir.create(file.path(paste0("C:/Users/eburchf/Desktop/TRASH/",years[i])))
+  rasterOptions(tmpdir=file.path(paste0("C:/Users/eburchf/Desktop/TRASH/",years[i])))
+
+  ppt <- stack(pptf[i])
+  tmin <- stack(tminf[i])
+  tmax <- stack(tmaxf[i])
+
+  roic <- spTransform(roi, tmin@crs)
+
+  ppt <- crop(ppt, roic)
+  tmin <- crop(tmin, roic)
+  tmax <- crop(tmax, roic)
+
+  bc <- biovars(ppt, tmin, tmax) # takes a sec, 1:07
+  writeRaster(bc, paste0("C:/Users/eburchf/OneDrive - Emory University/Data/DayMet/biovars_", years[i],".grd"), overwrite=T)
+  unlink(paste0("C:/Users/eburchf/Desktop/TRASH/",years[i]), recursive = TRUE, force = TRUE)
+}
+
+
+# average biovars rasters
+
+bv_list <- Sys.glob(paste0("C:/Users/eburchf/OneDrive - Emory University/Data/DayMet/biovars_*.grd"))
+r <- stack(bv_list[1])
+
+for (i in 1:length(bv_list)) {
+
+  r <- stack(bv_list[i])
+  print(r@crs)
+
+}
+
+# average of each slice of stack through time
+
+for (i in 1:dim(r)[3]) {
+
+  x <- stack()
+
+  for (f in 1:length(bv_list)) {
+
+    bvr <- stack(bv_list[f])
+
+    bvrs <- bvr[[i]]
+    bvrs@crs <- r@crs
+    x <- stack(x, bvrs)
+
+  }
+
+  mn <- calc(x, fun = mean, na.rm=T)
+  i <- str_pad(i, 2, "left", "0")
+  writeRaster(mn, paste0("C:/Users/eburchf/OneDrive - Emory University/Data/DayMet/mn_99_19/bv", i, ".grd"), overwrite=T)
+  remove(x, mn)
+  }
+
+# extract to points
+biovar_list <- sort(Sys.glob("C:/Users/eburchf/OneDrive - Emory University/Data/DayMet/mn_99_19/*.grd"))
+biovar <- stack(biovar_list)
+# projection information found here: https://cran.r-project.org/web/packages/daymetr/vignettes/daymetr-vignette.html
+raster::projection(biovar) <- "+proj=lcc +lat_1=25 +lat_2=60 +lat_0=42.5 +lon_0=-100 +x_0=0 +y_0=0 +a=6378137 +b=6356752.314706705 +units=m +no_defs"
+apm <- st_transform(ap, biovar@crs)
+
+bv_ext <- raster::extract(biovar, apm, df=T)
+bv_ext$FID <- apm$FID
+colnames(bv_ext) <- c("ID", "BV1", "BV2", "BV3", "BV4", "BV5", "BV6", "BV7", "BV8",
+                      "BV9", "BV10", "BV11", "BV12", "BV13", "BV14", "BV15", "BV16", "BV17", "BV18", "BV19", "FID")
+bv_ext <- bv_ext %>% select(-c(ID))
+saveRDS(bv_ext, "./out/biovars_extract.RDS")
+
+```
+
+**Future climate projections** came from the [WorldClim group.](https://www.worldclim.org/data/cmip6/cmip6climate.html)  Note that the 30-second projections are expected to be available soon.  These projections are monthly values over 20 year periods (2021-2040; 2041-2060; 2061-2080; 2081-2100).  From these monthly tmin, tmax, and ppt projections, WorldClim has computed the same `biovars`.  It looks like the data comes as summaries (by month if raw data or as the biovar variables) for a twenty-year period, so a sort of average of each parameter over this time range. From website: "The monthly values were averages over 20 year periods (2021-2040, 241-2060, 2061-2080, 2081-2100)." Since I project for 2040, 60, 80, and 2100 using the average climate conditions over the 20 years prior, so that's what I do here.  My presence points will be in 2019, so I want to capture the average over the previous 19 years, so I'd go from 2000 to 2019. See `CS_clean.R` for code used to process future data.
+
+* Fick, S.E. and R.J. Hijmans, 2017. WorldClim 2: new 1km spatial resolution climate surfaces for global land areas. International Journal of Climatology 37 (12): 4302-4315.
+
+Here's a list of the `biovars`:
+
+* bio1 = Mean annual temperature
+* bio2 = Mean diurnal range (mean of max temp - min temp)
+* bio3 = Isothermality (bio2/bio7) (* 100)
+* bio4 = Temperature seasonality (standard deviation *100)
+* bio5 = Max temperature of warmest month
+* bio6 = Min temperature of coldest month
+* bio7 = Temperature annual range (bio5-bio6)
+* bio8 = Mean temperature of the wettest quarter
+* bio9 = Mean temperature of driest quarter
+* bio10 = Mean temperature of warmest quarter
+* bio11 = Mean temperature of coldest quarter
+* bio12 = Total (annual) precipitation
+* bio13 = Precipitation of wettest month
+* bio14 = Precipitation of driest month
+* bio15 = Precipitation seasonality (coefficient of variation)
+* bio16 = Precipitation of wettest quarter
+* bio17 = Precipitation of driest quarter
+* bio18 = Precipitation of warmest quarter 
+* bio19 = Precipitation of coldest quarter
+
+***
+
+#### Soil 
+
+Given the size of this data and the complexities of wrangling it, it made more sense to focus on the [Harmonized World Soils Database](http://www.fao.org/soils-portal/soil-survey/soil-maps-and-databases/harmonized-world-soil-database-v12/en/) which is a 1 km dataset availble globally. The dataset originally comes in an Access database.  Check out the `hwsd.R` script for how to wrangle this into a raster format.
+
+* Wieder, W.R., J. Boehnert, G.B. Bonan, and M. Langseth. 2014. Regridded Harmonized World Soil Database v1.2. Data set. Available on-line [http://daac.ornl.gov] from Oak Ridge National Laboratory Distributed Active Archive Center, Oak Ridge, Tennessee, USA. http://dx.doi.org/10.3334/ORNLDAAC/1247.
+* Fischer, G., F. Nachtergaele, S. Prieler, H.T. van Velthuizen, L. Verelst, D. Wiberg, 2008. Global Agro-ecological Zones Assessment for Agriculture (GAEZ 2008). IIASA, Laxenburg, Austria and FAO, Rome, Italy. 
+```{r eval=F}
+# check out hwsd.R for the wizardry.
+soil_data <- Sys.glob("C:/Users/eburchf/OneDrive - Emory University/Data/HWSD/rasters/*.tif")
+soil_ras <- stack(soil_data)
+
+aps <- st_transform(ap, soil_ras@crs)
+
+soil_ext <- raster::extract(soil_ras, aps, df=T)
+soil_ext$FID <- aps$FID
+soil_ext$T_ECE <- soil_ext$TS_ECE
+soil_ext$T_SAND <- soil_ext$TS_SAND
+soil_ext <- soil_ext %>% dplyr::select(-c(ID, TS_ECE, TS_SAND))
+
+saveRDS(soil_ext, "./out/soil_extract.RDS")
+```
+
+Notes on other soil datasets:
+
+* Though [gSSURGO](https://www.nrcs.usda.gov/wps/portal/nrcs/detail/soils/home/?cid=nrcs142p2_053628) and [gNATSGO](https://nrcs.app.box.com/v/soils/folder/108071141504) are start-of-the-art in the US, none of the other datasets are at this high 30 meter resolution, so I'd end up resampling anyways and coarsening this data.^[Download data [here](https://gdg.sc.egov.usda.gov/GDGOrder.aspx?order=QuickState).  Also available is the [gNATSGO](https://nrcs.app.box.com/v/soils/folder/108071141504) dataset, most up-to-date, high resolution.] 
+* Coarser resolution [STATSGO2](https://www.nrcs.usda.gov/wps/portal/nrcs/detail/soils/survey/geo/?cid=nrcs142p2_053629) data.  "...a broad-based inventory of soils and non-soil areas" - SSURGO seems far too detailed given our scope, so STATSGO2 should be sufficient ([this presentation](https://nrcs.app.box.com/v/soils/file/643765519602) visualizes the differences).  Also [gNATSGO CONUS download](https://nrcs.app.box.com/v/soils/folder/108071141504).
+* Overview of available soil data [here](https://www.nrcs.usda.gov/wps/portal/nrcs/detail/soils/survey/tools/?cid=nrcseprd1407030).
+
+***
+
+#### Irrigation 
+
+MIRAD 1km meter 2002, 2007, 2012, 2017 downloaded [here](https://www.sciencebase.gov/catalog/item/5db08e84e4b0b0c58b56e04f).  This is the percent irrigated (based on 250 meter dataset) in a 1 km cell.  I defined a 1 km pixel as irrigated if any of this 1 km cell was listed as irrigated... this flexible definition works in my mind, allows for irrigation expansion in the future - though I should/could test sensitivity to different definitions, e.g. a 50% threshold.
+
+* Brown, J.F., Howard, D.M., Shrestha, D., and Benedict, T.D., 2019, Moderate Resolution Imaging Spectroradiometer (MODIS) Irrigated Agriculture Datasets for the Conterminous United States (MIrAD-US): U.S. Geological Survey data release, https://doi.org/10.5066/P9NA3EO8.
+
+```{r eval=F}
+# 2012 as "baseline"
+mirad_list <- Sys.glob("C:/Users/eburchf/OneDrive - Emory University/Data/MIRAD/mirad1km*.tif")
+mirad <- stack(mirad_list)
+apm <- st_transform(ap, mirad@crs)
+
+mirad_ext <- raster::extract(mirad, apm, df=T)
+mirad_ext$FID <- apm$FID
+colnames(mirad_ext) <- c("ID", "IRR_02", "IRR_07", "IRR_12", "IRR_17", "FID")
+mirad_ext <- mirad_ext %>% select(-c("ID"))
+mirad_ext$IRR_AVG <- rowMeans(mirad_ext[,c("IRR_02", "IRR_07", "IRR_12", "IRR_17")])
+mirad_ext$IRR_ZERO <- ifelse(mirad_ext$IRR_AVG > 0, 1, 0)
+mirad_ext$IRR_50 <- ifelse(mirad_ext$IRR_AVG > 50, 1, 0)
+saveRDS(mirad_ext, "./out/mirad_extract.RDS")
+```
+
+***
+
+#### Topography
+
+To align with the other 1 km datasets, I used the [North American 1-km resolution GRID](https://www.sciencebase.gov/catalog/item/4fb5495ee4b04cb937751d6d). This includes only elevation (m).  I computed slope in ArcGIS using the Spatial Analyst, Slope tool (Output measurement: DEGREE, Method: PLANAR, Z factor: 1, Z unit: METR)
+
+```{r eval=F}
+s <- raster("C:/Users/eburchf/OneDrive - Emory University/Data/DEM/NA_1KM_SLOPE.tif")
+d <- raster("C:/Users/eburchf/OneDrive - Emory University/Data/DEM/NA_1KM.tif")
+topo <- stack(s, d)
+aps <- st_transform(ap, s@crs)
+
+topo_ext <- extract(topo, aps, df=T)
+topo_ext$FID <- aps$FID
+colnames(topo_ext) <- c("ID", "SLOPE", "ELEVATION", "FID")
+topo_ext$ELEVATION[is.na(topo_ext$ELEVATION)] <- 0
+topo_ext <- topo_ext %>% dplyr::select(-c(ID))
+saveRDS(topo_ext, "./out/topo_extract.RDS")
+```
+
+Other datasets:
+
+* 30 meter Landfire data, downloadable from [this website](https://www.landfire.gov/version_comparison.php) (LF REMAP LF 2.0.0).  More information on slope data [here](https://www.landfire.gov/slope.php) and on elevation [here](https://www.landfire.gov/elevation.php). I opened in Arc since it was a file geodatabase and wrote out as `LF_slope.tif` and `LF_elevation.tif` in the DEM folder.
+
+
+# Extent rasters
+
+```{r}
+state_names <- unique(states$STATE_NAME)
+refras <- raster("./out/hist_grids/prob_CORN_CLIM.tif")
+crs_cdl <- CRS("+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+
+#p <- rasterToPolygons(refras) # takes a long sec
+#p <- spTransform(p, sras_stack@crs) # load reference CDL raster
+#writeOGR(p, "./out/extent/extent_grid.shp", driver ="ESRI Shapefile", layer = "Grid")
+p <- st_read("./out/extent/extent_grid.shp")
+
+build_extent_rasters <- function(cores, state_names, crop_idx = 1, crop_name = "CORN") {
+      foreach(i=1:length(state_names),
+              .packages= c("velox","foreach", "sf", "tidyverse", "raster", "sp"),
+              .combine = "rbind.data.frame",
+              .export = c("state_names", "p", "crop_dc_list")) %dopar% { 
+                
+                dir.create(file.path(paste0("C:/Users/eburchf/Desktop/TRASH/",state_names[i])))
+                rasterOptions(tmpdir=file.path(paste0("C:/Users/eburchf/Desktop/TRASH/",state_names[i])))
+                
+                # build state raster
+                sras_files <- ifelse(state_names[i] == "Virginia",
+                                     paste0("C:/Users/eburchf/Desktop/Data/CDL/States/*_Virginia.grd"),
+                                     paste0("C:/Users/eburchf/Desktop/Data/CDL/States/*", state_names[i], ".grd"))
+                sras_stack <- stack(Sys.glob(sras_files)) 
+                
+                # extract to points
+                pcrop <- function(ext, ...) {
+                    ext[ext == 0] <- NA
+                    ext <- ifelse(ext %in% crop_dc_list[[crop_idx]], 1, 0)
+                    ext <- ext[complete.cases(ext)]
+                    length(ext[ext == 1])/length(ext)  ##
+                    
+                }
+                
+                ext <- raster::extract(sras_stack, p, sp = F, fun = pcrop, cellnumbers=T)
+                saveRDS(ext, paste0("C:/Users/eburchf/Desktop/Data/CDL/CS_project/extracts/", crop_name, "_", state_names[i], ".RDS"))
+                
+                unlink(paste0("C:/Users/eburchf/Desktop/TRASH/",state_names[i]), recursive = TRUE, force = TRUE) 
+
+              }
+  
+}
+
+
+ptm <- proc.time()
+num_cores <- detectCores() - 4
+clus <- makeCluster(num_cores)
+registerDoParallel(clus)
+build_extent_rasters(cores = num_cores, state_names = state_names, crop_idx = 1, crop_name = "CORN")
+stopCluster(clus)
+
+
+# build together RDS files to make shp, then raster
+rds <- Sys.glob("C:/Users/eburchf/Desktop/Data/CDL/CS_project/extracts/*.RDS")
+
+df1 <- readRDS(rds[1])
+df1[is.na(df1)] <- 0
+
+for (i in 2:length(rds)) {
+  
+  r <- readRDS(rds[i])
+  r[is.na(r)] <- 0
+  
+  df1 <- df1 + r
+ 
+}
+
+df <- as.data.frame(df1)
+
+
+edle <- cbind.data.frame(lapply(Sys.glob("C:/Users/eburchf/Desktop/Data/CDL/CS_project/year*.RDS"), FUN = readRDS)) %>% select(-c(ID))
+#
+
+
+t <- readRDS(rds[1])
+s <- readRDS(rds[2])
+
+
+
