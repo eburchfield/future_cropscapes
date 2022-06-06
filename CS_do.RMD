@@ -1,0 +1,429 @@
+---
+title: "Crop suitability analysis"
+author: "Dr. Burchfield"
+date: "Last updated: `r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float: true
+    code_folding: hide
+---
+
+This doc contains the scripts to run the biophysical and full (biophysical + census) RF analyses. It also contains code used to assess the relative performance of different variable sets in predicting held-out data.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=F, warning=F)
+```
+
+```{r message=F, warning=F}
+set.seed(101)
+source("CS_load.R")
+source("CS_func.R")
+select <- dplyr::select
+
+# prep all the data for Census and bioclim runs
+full_list <- list()
+train_list <- list()
+test_list <- list()
+geom_list <- list()
+
+for (c in 1:length(crop_names)) {
+
+  crop_name <- crop_names[[c]]
+  
+  full <- apmc %>% 
+    filter(CROP == crop_name) %>%
+    select(AP, IRR, varlist[["Full"]]) %>%
+    drop_na() %>%
+    mutate(AP = as.factor(AP))
+ 
+  geom_list[[crop_name]] <- st_geometry(full)
+  st_geometry(full) <- NULL
+  full_list[[crop_name]] <- full
+
+  set.seed(1)
+    
+  # hold out 25% of the data, randomly selected in space and time:
+  random_rn <- sample(nrow(full), ceiling(nrow(full)*.25))
+  train_list[[crop_name]] <- full[-random_rn,]
+  test_list[[crop_name]] <- full[random_rn,]
+  
+}
+```
+
+
+# Performance 
+
+```{r eval=F}
+# This code generates error distributions by running on multiple test/training subsets of data:
+# and run the models for multiple iterations
+library(foreach)
+library(doParallel)
+
+num_cores <- detectCores() - 6
+clus <- makeCluster(num_cores)
+registerDoParallel(clus)
+run_those_models(crop_names, nint = 10)
+stopCluster(clus)
+```
+
+
+# Historical random forests models 
+
+Prepare data (built in `CS_clean.R` and described in `CS_data_construction.html`). Run on the subset of biophysical parameters (climate + soil + topography) and on the set of "all predictors" that includes inputs, farm resources, and farmer characteristics.
+
+
+## Climate only
+
+```{r}
+out_ext <- "_BIO.RDS"
+ntrain_list <- map(train_list, ~select(., AP, varlist[["Biophysical"]]))
+```
+
+Run `randomForest()`:
+
+```{r eval=F}
+run_historical_models(mtry_dir = "./out/mtry.RDS", out_ext = out_ext, data_list = ntrain_list)
+```
+
+Performance on testing data across models:
+
+```{r}
+perf <- rf_performance(test_list = test_list, out_ext = out_ext)
+DT::datatable(perf)
+```
+
+Variable importance:
+
+```{r echo=F}
+imp_final <- build_imp(out_ext)
+
+ggplot(imp_final %>% filter(CROP != "SWHEAT"), aes(x=reorder(varnames, MeanDecreaseGini), y=MeanDecreaseGini)) + 
+    geom_point() +
+    geom_segment(aes(x=varnames,xend=varnames,y=0,yend=MeanDecreaseGini)) +
+    ylab("Mean decrease Gini") +
+    xlab("") +
+    coord_flip() +
+    project_theme +
+    facet_wrap(~ CROP, ncol = 3, nrow=3) +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.position = "bottom")
+```
+
+
+## All predictors
+
+```{r}
+out_ext <- "_FULL.RDS"
+ntrain_list <- map(train_list, ~select(., AP, varlist[["Full"]]))
+```
+
+Run `randomForest()`:
+
+```{r eval=F}
+run_historical_models(mtry_dir = "./out/mtry_FULL.RDS", out_ext = out_ext, data_list = ntrain_list)
+```
+
+Performance on testing data across models:
+
+```{r}
+perf <- rf_performance(test_list = test_list, out_ext = out_ext)
+DT::datatable(perf)
+```
+
+Variable importance:
+
+```{r echo=F}
+imp_final <- build_imp(out_ext)
+
+ggplot(imp_final %>% filter(CROP != "SWHEAT"), aes(x=reorder(varnames, MeanDecreaseGini), y=MeanDecreaseGini)) + 
+    geom_point() +
+    geom_segment(aes(x=varnames,xend=varnames,y=0,yend=MeanDecreaseGini)) +
+    ylab("Mean decrease Gini") +
+    xlab("") +
+    coord_flip() +
+    project_theme +
+    facet_wrap(~ CROP, ncol = 3, nrow=3) +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.position = "bottom")
+
+# ggsave(paste0("./figs/by_crop_vip_", substr(out_ext, 1, 3), ".png", plot = last_plot(), width = 12, height = 8) # fix varnames
+```
+
+# Historical suitability prediction
+
+## Biophysical
+
+```{r eval=F}
+out_ext <- "_BIO.RDS"
+ntrain_list <- map(train_list, ~select(., AP, varlist[["Biophysical"]]))
+build_historical_grids(out_ext, vars = colnames(ntrain_list[[1]])) # takes longer with hires data
+```
+
+```{r}
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext)
+hv_clim[[1]]
+```
+
+## All predictors
+
+```{r}
+out_ext <- "_FULL.RDS"
+ntrain_list <- map(train_list, ~select(., AP, varlist[["Full"]]))
+build_historical_grids(out_ext, vars = colnames(ntrain_list[[1]]))
+```
+
+```{r}
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext)
+hv_full[[1]]
+```
+
+## Delta suitability
+
+```{r}
+all_ras <- hv_full[[2]] - hv_clim[[2]]
+
+names(all_ras) <- clean_crop_names[!(clean_crop_names %in% "Spring wheat")]
+  
+state_sp <- as(states, "Spatial")
+state_sp <- spTransform(state_sp, all_ras@crs)
+  
+coul2 <- colorRampPalette(brewer.pal(11, "BrBG"))
+  
+  
+diff <- levelplot(all_ras, 
+                         margin = F,
+                         xlab = "",
+                         ylab = "All predictors - climate and topography",
+                colorkey=list(space="bottom"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                         scales = list(draw=F), 
+                         layout = c(3, 2), 
+                         names.attr = names(all_ras), #rep("", dim(allvis)[3]),
+                         col.regions = coul2,
+                  at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+  
+
+diff
+```
+
+## Visualizing historical error
+
+I built a set of 2.5 million randomly allocated points. I extracted the actual CDL pixel values through time to each pixel and flagged whether each crop appeared from 2008 to 2019: 
+
+```{r eval=F}
+# sample points
+rpt <- st_as_sf(spsample(as(roi_rpj, "Spatial"), n = 2500000, "random")) # big n needed to ensure 10K AP for each crop
+saveRDS(rpt, "./data/sample_points.RDS")
+
+# extract CDL designated crop to points through time
+years <- 2008:2019
+rpt <- readRDS("C:/Users/eburchf/Desktop/Data/CDL/CS_project/sample_points.RDS")
+cdl_list <- Sys.glob("C:/Users/eburchf/Desktop/Data/CDL/*.img")
+for (y in 1:length(cdl_list)) {
+
+  print(years[[y]])
+  cdl <- raster(cdl_list[[y]])
+  rpts <- rpt
+
+  out <- raster::extract(cdl, rpts, df=T)
+  saveRDS(out, paste0("C:/Users/eburchf/Desktop/Data/CDL/CS_project/year", years[[y]], ".RDS"))
+
+}
+
+cdl_extract <- cbind.data.frame(lapply(Sys.glob("C:/Users/eburchf/Desktop/Data/CDL/CS_project/year*.RDS"), FUN = readRDS)) %>% select(-c(ID))
+saveRDS(cdl_extract, "./out/cdl_out.RDS")
+
+# Detect crops in CDL data
+cdl_extract <- readRDS("./out/cdl_out.RDS")
+cdle <- data.frame()[1:nrow(cdl_extract), ]
+cdle$CORN <- apply(cdl_extract,1,function(x) {sum(x %in% crop_dc_list[[1]],na.rm = TRUE)})
+cdle$COTTON <- apply(cdl_extract,1,function(x) {sum(x %in% crop_dc_list[[2]],na.rm = TRUE)})
+cdle$SOY <- apply(cdl_extract,1,function(x) {sum(x %in% crop_dc_list[[3]],na.rm = TRUE)})
+cdle$SWHEAT <- apply(cdl_extract,1,function(x) {sum(x %in% crop_dc_list[[4]],na.rm = TRUE)})
+cdle$WWHEAT <- apply(cdl_extract,1,function(x) {sum(x %in% crop_dc_list[[5]],na.rm = TRUE)})
+cdle$ALFALFA <- apply(cdl_extract,1,function(x) {sum(x %in% crop_dc_list[[6]],na.rm = TRUE)})
+cdle$HAY <- apply(cdl_extract,1,function(x) {sum(x %in% crop_dc_list[[7]],na.rm = TRUE)})
+
+# Count if they are more than threshold, save as sf
+tha <- 0 
+actual <- cdle %>%
+  mutate(CORN_ACT = ifelse(CORN > tha, "CORN", "OTHER"),
+         ALFALFA_ACT = ifelse(ALFALFA > tha, "ALFALFA", "OTHER"),
+         COTTON_ACT = ifelse(COTTON > tha, "COTTON", "OTHER"),
+         HAY_ACT = ifelse(HAY > tha, "HAY", "OTHER"),
+         SOY_ACT = ifelse(SOY > tha, "SOY", "OTHER"),
+         SWHEAT_ACT = ifelse(SWHEAT > tha, "SWHEAT", "OTHER"),
+         WWHEAT_ACT = ifelse(WWHEAT > tha, "WWHEAT", "OTHER"))
+st_geometry(actual) <- st_geometry(rpt)
+actual <- st_transform(actual, hs@crs)
+saveRDS(actual, "./out/cdl_extract.RDS")
+```
+
+Then I rasterized the CDL data and compared it to the predicted surfaces. Here, the threshold is 0.5:
+
+```{r eval=F}
+# build categorical error rasters
+bio_th <- find_threshold("_BIO.RDS", index = "Accuracy")
+build_error_rasters("BIO", source = "_DayMet", fact = 1, thdf = bio_th)
+
+full_th <- find_threshold("_FULL.RDS", index = "Accuracy")
+build_error_rasters("FULL", source = "_DayMet", fact = 1, thdf = full_th) #0.5
+```
+
+Build rasterized depictions of error by coarsening rasters to categories:
+
+```{r eval=F}
+clim_ras <- stack(Sys.glob("./out/hist_error/cat*_BIO_1_CSTH.tif")) 
+names(clim_ras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+full_ras <- stack(Sys.glob("./out/hist_error/cat*_FULL_1_CSTH.tif"))
+names(full_ras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+cols <- c("#228B22", "red", "blue", "light gray")
+state_sp <- spTransform(state_sp, clim_ras@crs)
+
+sras <- stack()
+
+for (i in 1:dim(clim_ras)[[3]]) {
+  
+  r <- clim_ras[[i]]
+  r <- ratify(r)
+  rat <- data.frame(ID = c(1, 2, 3, 4))
+  rat$TYPE <- NA
+  rat$TYPE[rat$ID == 1] <- "Correctly classified suitability" # green
+  rat$TYPE[rat$ID == 2] <- "Falsely classified suitability" # red
+  rat$TYPE[rat$ID == 3] <- "Falsely classified unsuitability" # blue
+  rat$TYPE[rat$ID == 4] <- "Correctly classified unsuitability" # gray
+    
+  levels(r) <- rat
+  sras <- stack(sras, r)
+  
+}
+  
+clim_viz <- levelplot(sras, 
+                      margin = F,
+                      xlab = "",
+                      ylab = "Biophysical",
+                      names.attr = names(clim_ras),
+                      colorkey=F,
+                      layout = c(3,2),
+                      #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                      # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                      scales = list(draw=F), 
+                      #  layout = c(4, 2), 
+                      # names.attr = rep("", dim(allvis)[3]),
+                      col.regions = cols) + # inferno viridis
+      layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+
+g1 <- grid.arrange(clim_viz, ncol=1, nrow=1)
+ggsave("./figs/cat_error_BIO_1_CSTH.png", g1, width=8, height=8)
+
+
+sras <- stack()
+
+for (i in 1:dim(clim_ras)[[3]]) {
+  
+  r <- full_ras[[i]]
+  r <- ratify(r)
+  rat <- data.frame(ID = c(1, 2, 3, 4))
+  rat$TYPE <- NA
+  rat$TYPE[rat$ID == 1] <- "Correctly classified suitability" # green
+  rat$TYPE[rat$ID == 2] <- "Falsely classified suitability" # red
+  rat$TYPE[rat$ID == 3] <- "Falsely classified unsuitability" # blue
+  rat$TYPE[rat$ID == 4] <- "Correctly classified unsuitability" # gray
+    
+  levels(r) <- rat
+  sras <- stack(sras, r)
+  
+}
+
+full_viz <- levelplot(sras, 
+                      margin = F,
+                      xlab = "",
+                      ylab = "All predictors",
+                      names.attr = names(full_ras),
+                      layout = c(3,2),
+                      colorkey=F,
+                      #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                      # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                      scales = list(draw=F), 
+                      #  layout = c(4, 2), 
+                      # names.attr = rep("", dim(allvis)[3]),
+                      col.regions = cols) + # inferno viridis
+      layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+
+g2 <- grid.arrange(full_viz, ncol=1, nrow=1)
+ggsave("./figs/cat_error_FULL_1+CSTH.png", g2, width=8, height=8)
+
+g3 <- grid.arrange(g1, g2, ncol = 1, nrow = 2)
+ggsave("./figs/cat_error_1_CSTH.png", g3, width = 8, height = 10)
+```
+
+
+# Future suitability predictions
+
+Build baseline reference historical suitability surface using attr_grids/5K_hist_attr merged with the ensemble biovars surfaces
+
+For each scenario (then average suitability rasters):
+
+```{r eval=F}
+build_future_grids(out_ext = "_BIO.RDS", full_list = full_list)
+```
+
+Then compute mean suitability projection across models and sd:
+
+```{r}
+ssps <- c("245", "370", "585")
+years <- c("2021-2040", "2041-2060", "2061-2080", "2081-2100")
+crop_names_sub <- c("CORN", "COTTON", "SOY", "WWHEAT", "ALFALFA", "HAY")
+
+for (i in 1:length(ssps)) {
+  
+  print(ssps[[i]])
+
+  for (j in 1:length(crop_names_sub)) {
+    
+    print(crop_names_sub[[j]])
+    
+    y20 <- stack(Sys.glob(paste0("./out/future_grids/prob*ssp", ssps[[i]], "*", "2021-2040", "*", crop_names_sub[[j]], "*.tif")))
+    y40 <- stack(Sys.glob(paste0("./out/future_grids/prob*ssp", ssps[[i]], "*", "2041-2060", "*", crop_names_sub[[j]], "*.tif")))
+    y60 <- stack(Sys.glob(paste0("./out/future_grids/prob*ssp", ssps[[i]], "*", "2061-2080", "*", crop_names_sub[[j]], "*.tif")))
+    y80 <- stack(Sys.glob(paste0("./out/future_grids/prob*ssp", ssps[[i]], "*", "2081-2100", "*", crop_names_sub[[j]], "*.tif")))
+    
+    y20m <- calc(y20, mean)
+    y20s <- calc(y20, sd)
+    
+    y40m <- calc(y40, mean)
+    y40s <- calc(y40, sd)
+    
+    y60m <- calc(y60, mean)
+    y60s <- calc(y60, sd)
+    
+    y80m <- calc(y80, mean)
+    y80s <- calc(y80, sd)
+    
+    ms <- stack(y20m, y40m, y60m, y80m)
+    names(ms) <- c("2021-2040", "2041-2060", "2061-2080", "2081-2100")
+    ss <- stack(y20s, y40s, y60s, y80s)
+    names(ss) <- c("2021-2040", "2041-2060", "2061-2080", "2081-2100")
+    
+    writeRaster(ms, paste0("./out/future_ens/mean_stack_", ssps[[i]], "_", crop_names_sub[[j]], ".tif"), overwrite=T)
+    writeRaster(ss, paste0("./out/future_ens/sd_stack_", ssps[[i]], "_", crop_names_sub[[j]], ".tif"), overwrite=T)
+
+  }
+
+}
+
+```
+

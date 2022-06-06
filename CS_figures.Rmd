@@ -1,0 +1,2093 @@
+---
+title: "CS_figures"
+author: "Emily Burchfield"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=F, warning=F)
+```
+
+```{r message=F, warning=F}
+set.seed(101)
+source("CS_load.R")
+source("CS_func.R")
+select <- dplyr::select
+
+library(gridExtra)
+library(rasterVis)
+library(viridisLite)
+
+# prep all the data for Census and bioclim runs
+full_list <- list()
+train_list <- list()
+test_list <- list()
+geom_list <- list()
+
+for (c in 1:length(crop_names)) {
+
+  crop_name <- crop_names[[c]]
+  
+  full <- apmc %>% 
+    filter(CROP == crop_name) %>%
+    select(AP, IRR, varlist[["Full"]]) %>%
+    drop_na() %>%
+    mutate(AP = as.factor(AP))
+ 
+  geom_list[[crop_name]] <- st_geometry(full)
+  st_geometry(full) <- NULL
+  full_list[[crop_name]] <- full
+
+  set.seed(1)
+    
+  # hold out 25% of the data, randomly selected in space and time:
+  random_rn <- sample(nrow(full), ceiling(nrow(full)*.25))
+  train_list[[crop_name]] <- full[-random_rn,]
+  test_list[[crop_name]] <- full[random_rn,]
+  
+}
+
+```
+
+# Figure ###: Performance by variable set
+
+```{r}
+# clean data
+perf <- Sys.glob("./out/human/*_perf_final_wclim.RDS") %>%
+  map(readRDS) %>%
+  bind_rows() %>%
+  filter(CROP != "SWHEAT") 
+perf$VARSET <- factor(perf$VARSET, levels = c("Climate", "Agricultural", "Biophysical", "Full"), 
+                      ordered = T)
+
+for (c in 1:length(crop_names)) {
+  
+  perf$CROP[perf$CROP == crop_names[[c]]] <- clean_crop_names[[c]]
+  
+}
+
+# visualize delta performance
+vnames <- list("PCC", "KAPPA", "SENSITIVITY", "SPECIFICITY", "AUC")
+vt <- list("PCC", "Kappa", "Sensitivity", "Specificity", "AUC")
+scaleFUN <- function(x) sprintf("%.2f", x)
+
+plt_list <- list()
+
+for (v in 1:length(vnames)) {
+  
+  vname <- as.character(vnames[[v]])
+
+  dp <- perf %>% 
+    group_by(VARSET, CROP) %>%
+    filter(!CROP == "SWHEAT") %>%
+    summarize(med = median(!!as.name(vname)))  
+
+  plt <- ggplot(dp) +
+    geom_bar(aes(x = factor(CROP), y = med, fill = factor(CROP), group = interaction(VARSET, CROP), alpha=VARSET), 
+             color = "light gray", stat = "identity", position = "dodge") +
+    colors_f +
+    project_theme +
+    labs(x = vt[[v]], 
+         y = "") +
+    theme(legend.title = element_blank(),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank()) +
+    guides(alpha=F) +
+    # scale_y_continuous(labels = scaleFUN) +
+    # coord_flip() +
+    # scale_y_discrete(limits = rev(levels(dp$VARSET)))  +
+    ylim(0,1) 
+
+ plt_list[[v]] <- plt
+
+}
+
+library(ggpubr)
+ggarrange(plt_list[[3]], plt_list[[4]], plt_list[[5]], 
+          labels = c("A", "B", "C"), ncol = 3, nrow = 1, common.legend = T, legend = "right")
+
+ggsave("./figs/performance_clean.png", plot = last_plot(), width = 12, height = 5)
+```
+
+# Table ###: Performance 
+
+Biophysical/soil full versus logical subset:
+
+```{r}
+perf <- Sys.glob("./out/human/*_perf_final_wclim.RDS") %>%
+  map(readRDS) %>%
+  bind_rows()
+
+for (c in 1:length(crop_names)) {
+  
+  perf$CROP[perf$CROP == crop_names[[c]]] <- clean_crop_names[[c]]
+  
+}
+
+perf_dat <- perf %>%
+  group_by(VARSET, CROP) %>%
+  filter(!CROP == "Spring wheat") %>%
+  summarize(mPCC = median(PCC), sdPCC = sd(PCC),
+            mSens = median(SENSITIVITY), sdSens = sd(SENSITIVITY),
+            mSpec = median(SPECIFICITY), sdSpec = median(SPECIFICITY),
+            mK = median(KAPPA), sdK = sd(KAPPA),
+            mAUC = median(AUC), sdAUC = sd(AUC)) %>%
+  select(-c(sdPCC, sdSens, sdSpec, sdK, sdAUC))
+
+
+View(perf_dat %>% filter(CROP != "Spring wheat") %>% filter(VARSET == "Climate")) 
+``` 
+
+Subset justified. So irrigation sensitivty with this subset?
+
+```{r}
+perf <- Sys.glob("./out/human/sensitivity_testing/*_perf_final.RDS") %>%
+  map(readRDS) %>%
+  bind_rows()
+
+for (c in 1:length(crop_names)) {
+  
+  perf$CROP[perf$CROP == crop_names[[c]]] <- clean_crop_names[[c]]
+  
+}
+
+perf_dat <- perf %>%
+  filter(VARSET %in% c("All predictors - MIRAD irrigation", "All predictors - % irrigated")) %>% # full in SI?
+  group_by(VARSET, CROP) %>%
+  filter(!CROP == "SWHEAT") %>%
+  summarize(mPCC = median(PCC), sdPCC = sd(PCC),
+            mSens = median(SENSITIVITY), sdSens = sd(SENSITIVITY),
+            mSpec = median(SPECIFICITY), sdSpec = median(SPECIFICITY),
+            mK = median(KAPPA), sdK = sd(KAPPA),
+            mAUC = median(AUC), sdAUC = sd(AUC))
+
+View(perf_dat %>% filter(CROP != "Spring wheat"))
+```
+
+Mirad actually does better, whew.
+
+So final has subset variables and MIRAD.
+
+# Figure ###: Importance bubble plot
+
+```{r}
+imp <- Sys.glob("./out/human/*_imp_final.RDS") %>%
+  map(readRDS) %>%
+  bind_rows()
+
+imp$VARSET <- factor(imp$VARSET, levels = c("Agricultural", "Biophysical", "Full"), 
+                      ordered = T)
+# levels(imp$VARSET) <- c("1", "2", "3")
+
+for (c in 1:length(crop_names)) {
+  
+  imp$CROP[imp$CROP == crop_names[[c]]] <- clean_crop_names[[c]]
+
+}
+
+uv <- sort(unique(imp$VARIABLES))
+newvars <- c("Mean annual temp.", "Total precip.", "Precip. wet", "Precip. dry", "Precip. seasonality", "Mean diurnal range",
+             "Temp. seasonality", "Max temp. warm", "Min temp. cold", "Drainage", "Elevation", "Slope", "CEC clay", "CEC soil", "% clay",
+             "% gravel", "% sand", "% silt", "Farm size", "Chemical use ($/acre)", "Years experience", "Fertilizer use ($/acre)", 
+             "Gvt. support ($/acre)", "Income ($/acre)", "Insurance (% acreage)", "Irrigation", "Labor ($/acre)", "Machinery ($/acre)", 
+             "Primary occup. (% operators)",
+             "Tenant (% operators)")
+
+imp$CLEANVAR <- NA
+for (i in 1:length(uv)) {
+  
+  imp$CLEANVAR[imp$VARIABLES == uv[[i]]] <- newvars[[i]]
+  
+}
+
+imps <- imp %>%
+  filter(CROP != "Spring wheat") %>%
+  group_by(VARSET, CROP, CLEANVAR, VARIABLES) %>% # collapse across iterations
+  summarize(MDG = mean(MEANDECREASEGINI),
+            SDG = sd(MEANDECREASEGINI)) %>% 
+  filter(VARSET == "Full") # focus on one VARSET per visualization (Climate and all preds in main paper, others in SI)
+
+impmax <- imps %>%
+  group_by(CROP) %>%
+  summarize(MMDG = max(MDG))
+
+imps <- merge(imps, impmax, by = "CROP") %>% mutate(MDG_S = MDG/MMDG)
+
+imps$CAT <- NA
+imps$CAT[imps$VARIABLES %in% climate_full] <- 5
+imps$CAT[imps$VARIABLES %in% c(soil_full, topo)] <- 4
+imps$CAT[imps$VARIABLES %in% c("IRR", "fert", "chem", "labor_expense", "machinery")] <- 3
+imps$CAT[imps$VARIABLES %in% c("exp", "occup", "tenant", "acres_per_op")] <- 2
+imps$CAT[imps$VARIABLES %in% c("income", "gvt_prog", "insur_acres")] <- 1
+
+# importance relative to best variable 
+bubble <- ggplot(data = imps) +
+  geom_point(aes(x = reorder(CLEANVAR, CAT), y = CROP, size = MDG_S, alpha = MDG_S, color = factor(CAT))) +
+ # geom_point(aes(x = reorder(CLEANVAR, CAT), y = CROP, size = MMDG, color = CAT)) +
+  # colors_c +
+  project_theme +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = "",
+       y = "") +
+  theme(legend.position = "none") + coord_flip() +
+  scale_color_manual(values = c("red", "orange", "blue", "brown", "dark green"))
+
+bubble
+
+ggsave("./figs/bubble_imp_std_FULL.png", bubble, width = 8, height = 8)
+
+# rename variables here
+```
+
+Most important variables:
+
+```{r}
+imp %>%
+  filter(CROP != "Spring wheat") %>%
+  group_by(VARSET, CLEANVAR, VARIABLES) %>% # collapse across iterations
+  summarize(MDG = mean(MEANDECREASEGINI),
+            SDG = sd(MEANDECREASEGINI)) %>% 
+  filter(VARSET == "Full") %>%
+  arrange(desc(MDG))
+```
+
+```{r}
+imp %>%
+  filter(CROP != "Spring wheat") %>%
+  group_by(VARSET, CLEANVAR) %>% # collapse across iterations
+  summarize(MDG = mean(MEANDECREASEGINI),
+            SDG = sd(MEANDECREASEGINI)) %>% 
+  filter(VARSET == "Biophysical") %>%
+  arrange(desc(MDG))
+```
+
+Variable importance across models:
+
+```{r}
+ip <- imp %>%
+  filter(CROP != "Spring wheat") %>%
+  group_by(VARSET, CLEANVAR) %>% # collapse across iterations
+  summarize(MDG = mean(MEANDECREASEGINI),
+            SDG = sd(MEANDECREASEGINI)) %>% 
+  filter(VARSET == "Full") %>%
+  ggplot(., aes(x = reorder(CLEANVAR, MDG), y = MDG)) +
+  geom_point() +
+  geom_segment(aes(x=reorder(CLEANVAR, MDG), xend=CLEANVAR,y=0,yend=MDG)) +
+  ylab("% increase in MSE") +
+  xlab("") +
+  ggtitle("") +
+  coord_flip() +
+  project_theme 
+
+ggsave("./figs/vip_across_crops.png", ip, width = 7, height= 7)
+```
+
+
+Variable importance for one crop:
+
+```{r}
+imp %>%
+  filter(CROP == "Soy") %>%
+  group_by(VARSET, CLEANVAR) %>% # collapse across iterations
+  summarize(MDG = mean(MEANDECREASEGINI),
+            SDG = sd(MEANDECREASEGINI)) %>% 
+  filter(VARSET == "Full") %>%
+  ggplot(., aes(x = reorder(CLEANVAR, MDG), y = MDG)) +
+  geom_point() +
+  geom_segment(aes(x=reorder(CLEANVAR, MDG), xend=CLEANVAR,y=0,yend=MDG)) +
+  ylab("% increase in MSE") +
+  xlab("") +
+  ggtitle("") +
+  coord_flip() +
+  project_theme 
+```
+
+
+# Figure ###: Historical suitability maps
+
+```{r}
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "A. Biophysical", ds = "_DayMet")
+#hv_clim[[1]]
+names(hv_clim[[2]]) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "B. Agricultural", ds = "_DayMet")
+names(hv_full[[2]]) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+
+all_ras <- hv_full[[2]] - hv_clim[[2]]
+
+names(all_ras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+  
+state_sp <- as(states, "Spatial")
+state_sp <- spTransform(state_sp, all_ras@crs)
+  
+coul2 <- colorRampPalette(brewer.pal(11, "BrBG"))
+  
+  
+diff <- levelplot(all_ras, 
+                         margin = F,
+                         xlab = "",
+                         ylab = "C. Agricultural - Biophysical",
+                colorkey=list(space="bottom"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                         scales = list(draw=F), 
+                         layout = c(3, 2), 
+                         names.attr = names(all_ras), #rep("", dim(allvis)[3]),
+                         col.regions = coul2,
+                  at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+
+library(gridExtra)
+g <- grid.arrange(hv_clim[[1]], hv_full[[1]], diff, ncol=1, nrow=3)
+# ggsave("./figs/hist_suitmaps_HEGS2.png", g, width=10, height=10)
+
+```
+
+```{r}
+# ggsave("./figs/hist_suitmaps.png", g, width=9, height=12)
+
+# hegs
+
+diff_hegs <- levelplot(all_ras[["Corn"]], 
+                         margin = F,
+                         xlab = "",
+                         ylab = "",
+                       main = "",
+                  colorkey=list(space="bottom"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                         scales = list(draw=F), 
+                         layout = c(1, 1), 
+                         names.attr = "", #rep("", dim(allvis)[3]),
+                         col.regions = coul2,
+                  at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+ hist_clim <- rasterVis::levelplot(hv_clim[[2]][["Corn"]], 
+                         margin = F,
+                         xlab = "",
+                         ylab = "",
+                         main = "",
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                         scales = list(draw=F), 
+                         layout = c(1, 1), 
+                         names.attr = "", #rep("", dim(allvis)[3]),
+                         col.regions = rev(terrain.colors(20)),
+                         colorkey=list(space="bottom"),
+                         at = seq(0, 1, length.out = 20)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+ 
+ hist_full <- rasterVis::levelplot(hv_full[[2]][["Corn"]], 
+                         margin = F,
+                         xlab = "",
+                         ylab = "",
+                         main = "",
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                         scales = list(draw=F), 
+                         layout = c(1, 1), 
+                         names.attr = "", #rep("", dim(allvis)[3]),
+                         col.regions = rev(terrain.colors(20)),
+                         colorkey=list(space="bottom"),
+                         at = seq(0, 1, length.out = 20)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969")) 
+
+  
+hegs1 <- ggarrange(hist_clim, hist_full, diff_hegs, ncol = 3, nrow = 1, labels = c("A.", "B.", "C."),
+                   font.label = list(size = 8))
+ggsave("./figs/hegs1.png", hegs1, width = 9, height = 3)
+```
+
+
+```{r}
+build_hist_vis <- function(out_ext, yl, ds = "_DayMet") {
+  
+  all_ras <- list()
+  library(viridis)
+  coul2 <- viridis::inferno(25)
+  
+  r <- stack(Sys.glob(paste0("./out/hist_grids/prob_*", substr(out_ext, 1, nchar(out_ext)-4), ds, ".tif")))
+  r <- dropLayer(r, paste0("prob_SWHEAT", substr(out_ext, 1, nchar(out_ext)-4), ds))
+
+  names(r) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+  r <- dropLayer(r, c("Alfalfa", "Cotton", "Hay"))
+
+  state_sp <- as(st_transform(states, r@crs), "Spatial")
+
+  hist_clim <- rasterVis::levelplot(r, 
+                         margin = F,
+                         xlab = "",
+                         ylab = yl,
+                         main = "",
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                         scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = names(r), #rep("", dim(allvis)[3]),
+                         col.regions = rev(terrain.colors(20)),
+                         colorkey=list(space="bottom"),
+                         at = seq(0, 1, length.out = 20)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+  
+  #pdf(paste0("./figs/hist_", substr(out_ext, 1, nchar(out_ext)-4), ".pdf"))
+  #print(hist_clim)
+  #dev.off()
+  out <- list(hist_clim, r)
+  
+  return(out)
+  
+  
+}
+
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "A. Biophysical", ds = "_DayMet")
+#hv_clim[[1]]
+names(hv_clim[[2]]) <- c("Corn", "Soy", "Wheat")
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "B. Agricultural", ds = "_DayMet")
+names(hv_full[[2]]) <- c("Corn", "Soy", "Wheat")
+
+
+all_ras <- hv_full[[2]] - hv_clim[[2]]
+
+names(all_ras) <- c("Corn", "Soy", "Wheat")
+  
+state_sp <- as(states, "Spatial")
+state_sp <- spTransform(state_sp, all_ras@crs)
+  
+coul2 <- colorRampPalette(brewer.pal(11, "BrBG"))
+  
+  
+diff <- levelplot(all_ras, 
+                         margin = F,
+                         xlab = "",
+                         ylab = "C. Agricultural - Biophysical",
+                colorkey=list(space="bottom"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                         scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = names(all_ras), #rep("", dim(allvis)[3]),
+                         col.regions = coul2,
+                  at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+
+library(gridExtra)
+g <- grid.arrange(hv_clim[[1]], hv_full[[1]], diff, ncol=1, nrow=3)
+# ggsave("./figs/hist_suitmaps_DISES.png", g, width=10, height=10)
+```
+
+
+# Figure ###: Areas where human suitable but not bio-suitable
+
+With crop-specific threshold that maximizes accuracy:
+
+```{r}
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "Biophysical", ds = "_DayMet")
+#hv_clim[[1]]
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "All predictors", ds = "_DayMet")
+#hv_full[[1]] 
+
+fras <- hv_full[[2]]
+cras <- hv_clim[[2]]
+
+names(cras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+names(fras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+full_th <- find_threshold("_BIO.RDS", index = "Accuracy")
+bio_th <- find_threshold("_FULL.RDS", index = "Accuracy")
+
+sras <- stack()
+  
+  for (i in 1:dim(cras)[[3]]) {
+    
+    full_ras <- fras[[i]]
+    clim_ras <- cras[[i]]
+    
+    thf <- full_th %>% filter(CCROP == names(fras)[[i]]) %>% pull(TH)
+    thc <- bio_th %>% filter(CCROP == names(cras)[[i]]) %>% pull(TH)
+    
+    full_ras[full_ras >= thf] <- 11
+    full_ras[full_ras < thf] <- 0
+    
+    clim_ras[clim_ras >=thc] <- 1
+    clim_ras[clim_ras < thc] <- 0
+        
+    r <- full_ras - clim_ras
+    r <- ratify(r)
+    # rat <- levels(r)[[1]]
+    rat <- data.frame(ID = c(-1, 0, 10, 11))
+   
+    rat$TYPE <- NA
+    rat$TYPE[rat$ID == -1] <- "Becomes unsuitable" #orange
+    rat$TYPE[rat$ID == 0] <- "Remains unsuitable" # gray
+    rat$TYPE[rat$ID == 10] <- "Remains suitable" # green
+    rat$TYPE[rat$ID == 11] <- "Becomes suitable" # purple
+    
+    levels(r) <- rat
+    sras <- stack(sras, r)
+    
+    
+  }
+  
+  names(sras) <- names(cras)
+  
+  cols <- c("orange", "light gray", "#228B22", "purple")
+  state_sp <- spTransform(state_sp, sras@crs)
+  
+  
+  fcat_viz <- levelplot(sras, 
+                        margin = F,
+                        xlab = "",
+                        ylab = "",
+                        names.attr = names(sras),
+                        layout = c(3, 2),
+                        colorkey=T,
+                        #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                        # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                        scales = list(draw=F), 
+                        #  layout = c(4, 2), 
+                        # names.attr = rep("", dim(allvis)[3]),
+                        col.regions = cols) + # inferno viridis
+    layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+  
+
+g <- grid.arrange(fcat_viz, ncol=1, nrow=1)
+#ggsave("./figs/human_expand_sui_cat.png", g, width=8, height=8)
+
+fcat_viz <- levelplot(sras[["Corn"]], 
+                        margin = F,
+                        xlab = "",
+                        ylab = "",
+                        names.attr = "",
+                        layout = c(1, 1),
+                        colorkey=list(space="right"),
+                        #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                        # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                        scales = list(draw=F), 
+                        #  layout = c(4, 2), 
+                        # names.attr = rep("", dim(allvis)[3]),
+                        col.regions = cols) + # inferno viridis
+    layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+g <- grid.arrange(fcat_viz, ncol=1, nrow=1)
+ggsave("./figs/hegs3.png", g, width=7, height=4)
+
+
+
+   
+```
+
+
+# Figure ###: Historical error (categorical)
+
+Threshold based on accuracy-maximizing th per crop (`_CSTH` crop specific threshold):
+
+```{r eval=F}
+clim_ras <- stack(Sys.glob("./out/hist_error/cat*_BIO_1_CSTH.tif")) # no tha is 0.5, K is kappa
+names(clim_ras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+full_ras <- stack(Sys.glob("./out/hist_error/cat*_FULL_1_CSTH.tif"))
+names(full_ras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+cols <- c("#228B22", "red", "#6699cc", "light gray")
+state_sp <- spTransform(state_sp, clim_ras@crs)
+
+sras <- stack()
+
+for (i in 1:dim(clim_ras)[[3]]) {
+  
+  r <- clim_ras[[i]]
+  r <- ratify(r)
+  rat <- data.frame(ID = c(1, 2, 3, 4))
+  rat$TYPE <- NA
+  rat$TYPE[rat$ID == 1] <- "Correctly classified suitability" # green
+  rat$TYPE[rat$ID == 2] <- "Falsely classified suitability" # red
+  rat$TYPE[rat$ID == 3] <- "Falsely classified unsuitability" # blue
+  rat$TYPE[rat$ID == 4] <- "Correctly classified unsuitability" # gray
+    
+  levels(r) <- rat
+  sras <- stack(sras, r)
+  
+}
+  
+clim_viz <- levelplot(sras, 
+                      margin = F,
+                      xlab = "",
+                      ylab = "A. Biophysical",
+                      names.attr = names(clim_ras),
+                      colorkey=T,
+                      layout = c(3,2),
+                      #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                      # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                      scales = list(draw=F), 
+                      #  layout = c(4, 2), 
+                      # names.attr = rep("", dim(allvis)[3]),
+                      col.regions = cols) + # inferno viridis
+      layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+
+g1 <- grid.arrange(clim_viz, ncol=1, nrow=1)
+ggsave("./figs/cat_error_BIO_1_CSTH.png", g1, width=8, height=8)
+
+
+srasf <- stack()
+
+for (i in 1:dim(clim_ras)[[3]]) {
+  
+  r <- full_ras[[i]]
+  r <- ratify(r)
+  rat <- data.frame(ID = c(1, 2, 3, 4))
+  rat$TYPE <- NA
+  rat$TYPE[rat$ID == 1] <- "Correctly classified suitability" # green
+  rat$TYPE[rat$ID == 2] <- "Falsely classified suitability" # red
+  rat$TYPE[rat$ID == 3] <- "Falsely classified unsuitability" # blue
+  rat$TYPE[rat$ID == 4] <- "Correctly classified unsuitability" # gray
+    
+  levels(r) <- rat
+  srasf <- stack(srasf, r)
+  
+}
+
+full_viz <- levelplot(srasf, 
+                      margin = F,
+                      xlab = "",
+                      ylab = "B. Agricultural",
+                      names.attr = names(full_ras),
+                      layout = c(3,2),
+                      colorkey=F,
+                      #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                      # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                      scales = list(draw=F), 
+                      #  layout = c(4, 2), 
+                      # names.attr = rep("", dim(allvis)[3]),
+                      col.regions = cols) + # inferno viridis
+      layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+
+g2 <- grid.arrange(full_viz, ncol=1, nrow=1)
+ggsave("./figs/cat_error_FULL_1_CSTH.png", g2, width=8, height=8)
+
+g3 <- grid.arrange(g1, g2, ncol = 1, nrow = 2)
+ggsave("./figs/cat_error_1_CSTH.png", g3, width = 8, height = 10)
+
+# hegs
+
+hviz <- levelplot(sras[["Corn"]], 
+                      margin = F,
+                      xlab = "",
+                      ylab = "",
+                      names.attr = "",
+                      layout = c(1,1),
+                      colorkey=F,
+                      #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                      # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                      scales = list(draw=F), 
+                      #  layout = c(4, 2), 
+                      # names.attr = rep("", dim(allvis)[3]),
+                      col.regions = cols) + # inferno viridis
+      layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+fviz <- levelplot(srasf[["Corn"]], 
+                      margin = F,
+                      xlab = "",
+                      ylab = "",
+                      names.attr = "",
+                      layout = c(1,1),
+                      colorkey=F,
+                      #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                      # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                      scales = list(draw=F), 
+                      #  layout = c(4, 2), 
+                      # names.attr = rep("", dim(allvis)[3]),
+                      col.regions = cols) + # inferno viridis
+      layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+hegs2 <- ggarrange(hviz, fviz, ncol = 2, nrow = 1, labels = c("A.", "B."),
+                   font.label = list(size = 8))
+ggsave("./figs/hegs2.png", hegs2, width = 8, height = 3)
+```
+
+# Figure ###: PDP
+
+```{r echo=F, eval=F}
+out_ext <- "_BIO.RDS"
+pdp <- list()
+
+vn <- varlist[["Biophysical"]]
+
+for (j in 1:length(vn)) {
+  print(vn[[j]])
+for (i in 1:length(crop_names)) {
+  
+  crop = crop_names[[i]]
+  print(crop)
+  rf <- readRDS(paste0("./out/RF_historical/", crop, out_ext))
+  out <- as.data.frame(partialPlot(rf, train_list[[crop]], vn[[j]])) # B5_MAXTEMP_WARM
+  out$CROP <- clean_crop_names[[i]]
+  pdp[[i]] <- out
+  
+}
+
+pdf <- do.call("rbind.data.frame", pdp)
+saveRDS(pdf, paste0("./out/pdp/", vn[[j]], "_BIO.RDS"))#_FULL just has no extension
+}
+
+```
+
+Agricultural predictor plots:
+
+```{r}
+# make sure out-ext is blank here to capture FULL model suite
+
+pdf <- build_pdf_trimmed("chem", out_ext = "")
+chem <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "$/acre",
+       y = "Predicted weighted average",
+       title = "A. Chemicals") +
+  xlim(c(0,100))
+
+
+pdf <- build_pdf_trimmed("fert",  out_ext = "")
+fert <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(title = "B. Fertilizer",
+       y = "",
+       x = "$/acre") +
+  xlim(c(0,100))
+
+pdf <- build_pdf_trimmed("insur_acres",  out_ext = "")
+ins <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "% acres",
+       y = "Predicted weighted average",
+       title = "C. Insurance") +
+  xlim(c(0,100))
+
+
+pdf <- build_pdf_trimmed("gvt_prog",  out_ext = "")
+gvt <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(title = "D. Government receipts",
+       x = "$/acre",
+       y = "") +
+  xlim(c(0,40))
+
+library(ggpubr)
+ggarrange(chem, fert, ins, gvt, ncol = 2, nrow = 2, common.legend = T, legend = "bottom")
+ggsave("./figs/pdp_ag.png", plot = last_plot(), width = 8, height = 8)
+
+```
+
+Nonlinearities in top climatic predictors (from full model):
+
+```{r}
+top <- 4.5
+bottom = -1.5
+pdf <- build_pdf_trimmed("B5_MAXTEMP_WARM")
+b5 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Max temp. warm (°C)",
+       y = "") +
+  ylim(c(bottom,top)) +
+  xlim(c(24, 40))
+
+pdf <- build_pdf_trimmed("B1_MEAN_ANNUAL_TEMP")
+b1 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x =  "Mean annual temp. (°C)",
+       y = "Predicted weighted average") +
+  ylim(c(bottom,top))
+
+pdf <- build_pdf_trimmed("B4_TEMP_SEASONALITY")
+b4 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Temp. seasonality",
+       y = "Predicted weighted average") +
+  ylim(c(bottom,top))
+
+pdf <- build_pdf_trimmed("B6_MINTEMP_COLD")
+b6 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Min temp. cold (°C)",
+       y = "") +
+  ylim(c(bottom,top))
+
+pdf <- build_pdf_trimmed("B12_TOTAL_PPT")
+b12 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Total precip. (mm)",
+       y =  "Predicted weighted average") +
+  ylim(c(bottom,top)) +
+  xlim(c(0, 2000))
+
+pdf <- build_pdf_trimmed("B14_PPT_DRY")
+b14 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = CROP, color = CROP), size = 1.2) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Driest month precip. (mm)",
+       y = "") +
+  ylim(c(bottom,top)) +
+  xlim(c(0,60))
+
+library(ggpubr)
+ggarrange(b1, b5, b12, b14, ncol = 2, nrow = 2, common.legend = T, legend = "bottom")
+ggsave("./figs/pdp_clim_full_ALL.png", plot = last_plot(), width = 8, height = 8)
+
+```
+
+Comparign biophysical to agricultural:
+
+```{r}
+top <- 4.5
+bottom = -3
+
+pdfh <- build_pdf_trimmed("B1_MEAN_ANNUAL_TEMP", out_ext = "")
+pdfh$MODEL <- "Full"
+pdfb <- build_pdf_trimmed("B1_MEAN_ANNUAL_TEMP")
+pdfb$MODEL <- "Biophysical"
+pdf <- rbind.data.frame(pdfh, pdfb)
+b1 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = interaction(CROP, MODEL), color = CROP, linetype = MODEL), size = 1.2, alpha = 0.7) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Mean annual temperature",
+       y = "Predicted weighted average") +
+  ylim(c(bottom, top))
+
+pdfh <- build_pdf_trimmed("B5_MAXTEMP_WARM", out_ext = "")
+pdfh$MODEL <- "Full"
+pdfb <- build_pdf_trimmed("B5_MAXTEMP_WARM")
+pdfb$MODEL <- "Biophysical"
+pdf <- rbind.data.frame(pdfh, pdfb)
+b5 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = interaction(CROP, MODEL), color = CROP, linetype = MODEL), size = 1.2, alpha = 0.7) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Max temp. warm (°C)",
+       y = "") +
+  ylim(c(bottom, top))
+
+pdfh <- build_pdf_trimmed("B12_TOTAL_PPT", out_ext = "")
+pdfh$MODEL <- "Full"
+pdfb <- build_pdf_trimmed("B12_TOTAL_PPT")
+pdfb$MODEL <- "Biophysical"
+pdf <- rbind.data.frame(pdfh, pdfb)
+b12 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = interaction(CROP, MODEL), color = CROP, linetype = MODEL), size = 1.2, alpha = 0.7) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Total precip. (mm)",
+       y = "Predicted weighted average") +
+  ylim(c(bottom, top)) +
+  xlim(c(0, 1750))
+
+pdfh <- build_pdf_trimmed("B14_PPT_DRY", out_ext = "")
+pdfh$MODEL <- "Full"
+pdfb <- build_pdf_trimmed("B14_PPT_DRY")
+pdfb$MODEL <- "Biophysical"
+pdf <- rbind.data.frame(pdfh, pdfb)
+b14 <- ggplot(pdf) +
+  geom_line(aes(x = x, y = y, group = interaction(CROP, MODEL), color = CROP, linetype = MODEL), size = 1.2, alpha = 0.7) +
+  colors_c +
+  project_theme +
+  theme(legend.title = element_blank(), legend.position = "right" ) +
+  labs(x = "Driest month precip. (mm)",
+       y = "") +
+  ylim(c(bottom, top)) +
+  xlim(c(0, 50))
+
+library(ggpubr)
+ggarrange(b1, b5, b12, b14, ncol = 2, nrow = 2, common.legend = T, legend = "bottom")
+ggsave("./figs/pdp_clim_BOTH.png", plot = last_plot(), width = 8, height = 8)
+
+
+```
+
+# Figure ###: Delta bioclim predictors
+
+Compared to most recent projections (2021-2040) - call it relative to 2020?
+
+```{r eval=F}
+hist_preds <- brick("./out/attr_grids/5k_hist_attr_DayMet.grd")
+hist_preds <- subset(hist_preds, climate_sub)
+
+years = "_2041-2060"
+fut <- Sys.glob(paste0("C:/Users/eburchf/OneDrive - Emory University/Data/WorldClim/future/CS_grids/*", years, ".grd"))[10:12] 
+ssps <- list("245", "370", "585")
+
+for (i in 1:length(fut)) {
+  
+  f <- stack(fut[[i]])
+  names(f) <- climate_full
+  f <- subset(f, climate_sub)
+  
+  #h <- stack(ref[[i]])
+  #names(h) <- climate_full
+  #h <- subset(h, climate_sub)
+  
+  pc <- f - hist_preds
+  names(pc) <- climate_sub
+  writeRaster(pc, paste0("./out/clim/delta", years, "_", ssps[[i]], "_DayMet_MRI.tif"), overwrite=T)
+
+}
+
+```
+
+This code generates in one period for one model RCP differences:
+
+```{r}
+years = "_2081-2100"
+s2 <- stack(paste0("./out/clim/delta", years, "_245_DayMet_MIROC.tif")) #CanESM, IPSL, MIROC, MRI
+s3 <- stack(paste0("./out/clim/delta", years, "_370_DayMet_MIROC.tif"))
+s5 <- stack(paste0("./out/clim/delta", years, "_585_DayMet_MIROC.tif"))
+
+cn <- c("Mean annual temp.", "Mean diurnal range", "Temp. seasonality", "Max temp. warm", "Min temp. cold", "Total precip.", "Precip. wet",
+        "Precip. dry", "Precip. seasonality")
+names(s2) <- cn
+names(s3) <- cn
+names(s5) <- cn
+
+coul2 <- colorRampPalette(brewer.pal(11, "YlOrBr"))
+
+mean_temp <- stack(s2[["Mean.annual.temp."]], s3[["Mean.annual.temp."]], s5[["Mean.annual.temp."]])
+max_temp <- stack(s2[["Max.temp..warm"]], s3[["Max.temp..warm"]], s5[["Max.temp..warm"]] )
+total_ppt <- stack(s2[["Total.precip."]], s3[["Total.precip."]], s5[["Total.precip."]])
+precip_seas <- stack(s2[["Precip..dry"]], s2[["Precip..dry"]], s2[["Precip..dry"]]) 
+
+# mtc <- stack(s2[["Min.temp..cold"]], s3[["Min.temp..cold"]], s5[["Min.temp..cold"]])
+
+scen <- c("SSP245", "SSP370", "SSP585")
+
+meant <- levelplot(mean_temp,
+                  margin = F,
+                  xlab = "",
+                  ylab = "Mean temp (°C)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = scen, #rep("", dim(allvis)[3]),
+                         col.regions = coul2) +
+                  # at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+maxt <- levelplot(max_temp,
+                  margin = F,
+                  xlab = "",
+                  ylab = "Max temp. (°C)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = scen, #rep("", dim(allvis)[3]),
+                         col.regions = coul2) +
+                  # at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+coul2 <- colorRampPalette(brewer.pal(11, "BrBG"))
+
+totp <- levelplot(total_ppt,
+                  margin = F,
+                  xlab = "",
+                  ylab = "Total precip. (mm)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = scen, #rep("", dim(allvis)[3]),
+                         col.regions = coul2) +
+                  # at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+coul2 <- colorRampPalette(brewer.pal(11, "PuBu"))
+
+pseas <- levelplot(precip_seas,
+                  margin = F,
+                  xlab = "",
+                  ylab = "Dry season precip. (mm)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = scen, #rep("", dim(allvis)[3]),
+                         col.regions = coul2) +
+                  # at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+  
+library(gridExtra)
+g <- grid.arrange(meant, maxt, totp, pseas, ncol=1, nrow=4)
+ggsave(paste0("./figs/delta_clim_", years, "_DayMet_MIROC.png"), g, width=8, height=12)
+
+```
+
+And this code generates for one SSP anticipated changes through time:
+
+```{r eval=F}
+#s2 <- Sys.glob(paste0("C:/Users/eburchf/OneDrive - Emory University/Data/WorldClim/future/CS_grids/wc2.1_2.5m_bioc_IPSL-CM6A-LR*245*.grd"))
+#s3 <- Sys.glob(paste0("C:/Users/eburchf/OneDrive - Emory University/Data/WorldClim/future/CS_grids/wc2.1_2.5m_bioc_IPSL-CM6A-LR*370*.grd"))[2:4]
+#s5 <- Sys.glob(paste0("C:/Users/eburchf/OneDrive - Emory University/Data/WorldClim/future/CS_grids/wc2.1_2.5m_bioc_IPSL-CM6A-LR*585*.grd"))[2:4]
+
+s2 <- Sys.glob(paste0("./out/clim/delta*_245_DayMet_IPSL.tif")) 
+s3 <- Sys.glob(paste0("./out/clim/delta*_370_DayMet_IPSL.tif")) 
+s5 <- Sys.glob(paste0("./out/clim/delta*_585_DayMet_IPSL.tif")) 
+
+cn <- c("Mean annual temp.", "Mean diurnal range", "Temp. seasonality", "Max temp. warm", "Min temp. cold", "Total precip.", "Precip. wet",
+        "Precip. dry", "Precip. seasonality")
+
+slist <- list(s2, s3, s5)
+ssps <- c("245", "370", "585")
+bvlist <- c("Mean.annual.temp.", "Max.temp..warm", "Total.precip.", "Precip..dry")
+
+i = 2
+s <- slist[[i]]
+ssp <- ssps[i]
+  
+stks <- list()
+  
+for (var in 1:length(bvlist)) {
+  
+  y40 <- stack(s[[1]])
+  names(y40) <- cn
+  y40 <- subset(y40, bvlist[[var]])
+  
+  y60 <- stack(s[[2]])
+  names(y60) <- cn
+  y60 <- subset(y60, bvlist[[var]])
+  
+  y80 <- stack(s[[3]])
+  names(y80) <- cn
+  y80 <- subset(y80, bvlist[[var]])
+    
+  vs <- stack(y40, y60, y80)
+  stks[[var]] <- vs
+  
+}
+  
+coul2 <- colorRampPalette(brewer.pal(11, "YlOrBr"))
+state_sp <- as(st_transform(states, vs@crs), "Spatial")
+
+meant <- levelplot(stks[[1]],
+                  margin = F,
+                  xlab = "",
+                  ylab = "A. Mean temp (°C)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                        # ylab=list(c("2081-2100", "2061-2080", "2041-2060"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = c("2041-2060","2061-2080", "2081-2100") , #rep("", dim(allvis)[3]),
+                         col.regions = coul2) +
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+maxt <- levelplot(stks[[2]],
+                  margin = F,
+                  xlab = "",
+                  ylab = "B. Max temp. (°C)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = c("2041-2060","2061-2080", "2081-2100") ,
+                         col.regions = coul2) +
+                  # at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+coul2 <- colorRampPalette(brewer.pal(11, "BrBG"))
+
+totp <- levelplot(stks[[3]],
+                  margin = F,
+                  xlab = "",
+                  ylab = "C. Total precip. (mm)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = c("2041-2060","2061-2080", "2081-2100") , #rep("", dim(allvis)[3]),
+                         col.regions = coul2) +
+                  # at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+coul2 <- colorRampPalette(brewer.pal(9, "PuBu"))
+
+pseas <- levelplot(stks[[4]],
+                  margin = F,
+                  xlab = "",
+                  ylab = "D. Driest month precip. (mm)",
+                  colorkey=list(space="right"),
+                         # xlab = list(names(all_ras), space = "top"),  # winter wheat
+                         # ylab=list(c("2081-2100", "2061-2080", "2041-2060", "2000-2020"), rot=0), 
+                  scales = list(draw=F), 
+                         layout = c(3, 1), 
+                         names.attr = c("2041-2060","2061-2080", "2081-2100") , #rep("", dim(allvis)[3]),
+                         col.regions = coul2) +
+                  # at = seq(-0.8, 0.8, length.out = 11)) + # inferno viridis
+    latticeExtra::layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+  
+library(gridExtra)
+g <- grid.arrange(meant, maxt, totp, pseas, ncol=1, nrow=4)
+ggsave(paste0("./figs/delta_clim_", ssp, "_DayMet_IPSL.png"), g, width=8, height=10)
+
+```
+
+Pulling some figures for the paper:
+
+```{r}
+fut <- Sys.glob(paste0("C:/Users/eburchf/OneDrive - Emory University/Data/WorldClim/future/CS_grids/*.grd"))[10:12] 
+eoc <- stack(fut[[3]])
+
+range(eoc[["B10_MEANTEMP_WARM"]])
+
+```
+
+
+
+# Figure ###: Future suitability projections
+
+```{r}
+build_ensemble_figure(ssp = "245")
+build_ensemble_figure(ssp = "370")
+build_ensemble_figure(ssp = "585")
+```
+
+# Figure ###: Delta suitability
+
+```{r eval=F}
+build_ensemble_delta_figure(ssp = "245")
+build_ensemble_delta_figure(ssp = "370")
+build_ensemble_delta_figure(ssp = "585")
+```
+
+
+# Figure ###: Categorical delta suitability 
+
+* Remains suitable - green (10)
+* Newly suitable - blue (11)
+* Becomes unsuitable - red (-1)
+* Remains unsuitable - gray (0)
+
+Might be able to justify a more "lenient" threshold - or define like "areas that used to be suitable that drop below 0.3" or something like that.
+
+```{r}
+bio_th_k <- find_threshold("_BIO.RDS", index = "Accuracy")
+# bio_th_k$TH <- 0.4
+
+future_cat_viz(ssp = "585", th = bio_th_k) # threshold across crops that captures most suitability historically, different per crop
+future_cat_viz(ssp = "370", th = bio_th_k)
+future_cat_viz(ssp = "245", th = bio_th_k)
+```
+
+## Figure ###: Categorical delta suitability with human 
+
+What happens if we add the historical levels of human influence?
+
+```{r}
+full_th_k <- find_threshold("_FULL.RDS", index = "Accuracy")
+# full_th_k$TH <- 0.4
+
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "Biophysical", ds = "_DayMet")
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "All predictors", ds = "_DayMet")
+
+diff_ras <- hv_full[[2]] - hv_clim[[2]]
+
+future_cat_viz_ppl(ssp = "585", th = full_th_k, diff_ras = diff_ras) # justify based on the threshold that captures most suitability historically?
+future_cat_viz_ppl(ssp = "370", th = full_th_k, diff_ras = diff_ras)
+future_cat_viz_ppl(ssp = "245", th = full_th_k, diff_ras = diff_ras)
+
+```
+
+# Figure ###: Delta suitability - binary
+
+```{r}
+thf <- find_threshold("_FULL.RDS", index = "Accuracy")
+thb <- find_threshold("_BIO.RDS", index = "Accuracy")
+
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "Biophysical", ds = "_DayMet")
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "All predictors", ds = "_DayMet")
+
+diff_ras <- hv_full[[2]] - hv_clim[[2]]
+
+future_bin_viz(ssp = "585", th = th, diff_ras = diff_ras)
+future_bin_viz(ssp = "370", th = th, diff_ras = diff_ras)
+future_bin_viz(ssp = "245", th = th, diff_ras = diff_ras)
+```
+
+
+
+# Figure ###: RMA visualization
+
+Subset to period in this study.
+
+```{r}
+col <- readRDS("C:/Users/eburchf/OneDrive - Emory University/WF/Crop_insurance/out/COL.RDS") %>%
+  filter(Year %in% 2008:2019)
+col$CauseOfLoss[col$CauseOfLoss == "ARPI/SCO/STAX/MP Crops Only"] <- "GRP/Grip Crops"
+col <- col %>% filter(StateAbbr %in% unique(states$STATE_ABBR))
+
+nla <- col %>% group_by(CauseOfLoss) %>%
+  summarize(NLA = sum(NetLostAcres, na.rm=T)) %>%
+  arrange(desc(NLA)) %>% 
+  mutate(CAT = NA)
+
+nla$CAT[nla$CauseOfLoss %in% c("Drought", "Excess Moisture/Precipitation/Rain", "Hail", "Flood", "Heat", "Freeze", "Cold Wet Weather", "Wind/Excess Wind", "Cold Winter", "Hot Wind")] <- "Environmental"
+nla$CAT[is.na(nla$CAT)] <- "Other"
+nla$CauseOfLoss[nla$CauseOfLoss == "Excess Moisture/Precipitation/Rain"] <- "Excess Precipitation"
+nla$CauseOfLoss[nla$CauseOfLoss == "Wind/Excess Wind"] <- "Excess Wind"
+nla <- nla %>% filter(!is.na(CauseOfLoss))
+library(scales)
+ggplot(nla[1:10,]) +
+  geom_bar(aes(x = reorder(CauseOfLoss, desc(NLA)), y = NLA, fill = CAT), stat = "identity") +
+  project_theme +
+  scale_y_continuous(labels = comma) +
+  labs(x = "",
+       title = "Net acres lost (2008 - 2019)",
+       y= "",
+       fill = "") +  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_fill_manual(values = c("dark green", "gray")) +
+  coord_flip()
+
+ggsave("./figs/rma_loss2.png", width = 6, height=5)
+
+
+```
+# Figure ###: Attributes of switchers
+
+```{r}
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "Biophysical", ds = "_DayMet")
+#hv_clim[[1]]
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "All predictors", ds = "_DayMet")
+#hv_full[[1]] 
+
+fras <- hv_full[[2]]
+cras <- hv_clim[[2]]
+
+names(cras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+names(fras) <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Wheat")
+
+full_th <- find_threshold("_BIO.RDS", index = "Accuracy")
+bio_th <- find_threshold("_FULL.RDS", index = "Accuracy")
+
+sras <- stack()
+  
+  for (i in 1:dim(cras)[[3]]) {
+    
+    full_ras <- fras[[i]]
+    clim_ras <- cras[[i]]
+    
+    thf <- full_th %>% filter(CCROP == names(fras)[[i]]) %>% pull(TH)
+    thc <- bio_th %>% filter(CCROP == names(cras)[[i]]) %>% pull(TH)
+    
+    full_ras[full_ras >= thf] <- 11
+    full_ras[full_ras < thf] <- 0
+    
+    clim_ras[clim_ras >=thc] <- 1
+    clim_ras[clim_ras < thc] <- 0
+        
+    r <- full_ras - clim_ras
+    r <- ratify(r)
+    # rat <- levels(r)[[1]]
+    rat <- data.frame(ID = c(-1, 0, 10, 11))
+   
+    rat$TYPE <- NA
+    rat$TYPE[rat$ID == -1] <- "Becomes unsuitable" #orange
+    rat$TYPE[rat$ID == 0] <- "Remains unsuitable" # gray
+    rat$TYPE[rat$ID == 10] <- "Remains suitable" # green
+    rat$TYPE[rat$ID == 11] <- "Becomes suitable" # purple
+    
+    levels(r) <- rat
+    sras <- stack(sras, r)
+    
+    
+  }
+  
+  names(sras) <- names(cras)
+  
+attr <- stack("./out/attr_grids/FULLhist_WC.grd")
+ins <- attr[["insur_acres"]]
+gvt <- attr[["gvt_prog"]]
+chem <- attr[["chem"]]
+fert <- attr[["fert"]]
+
+make_comp_plot <- function(input, label, th) {
+  
+  ###################################
+olist <- list()
+plist <- list()
+glist <- list()
+
+for (i in 1:length(names(sras))) {
+ 
+  olist[[names(sras)[i]]] <- input[sras[[i]] == -1]
+  plist[[names(sras)[i]]] <- input[sras[[i]] == 11]
+  glist[[names(sras)[i]]] <- input[sras[[i]] == 10]
+}
+
+odf <- as.data.frame(Reduce(c, olist))
+odf$CAT <- "Becomes unsuitable"
+colnames(odf) <- c("VALUES", "CAT")
+pdf <- as.data.frame(Reduce(c, plist))
+pdf$CAT <- "Becomes suitable"
+colnames(pdf) <- c("VALUES", "CAT")
+gdf <- as.data.frame(Reduce(c, glist))
+gdf$CAT <- "Remains suitable"
+colnames(gdf) <- c("VALUES", "CAT")
+
+out <- rbind.data.frame(odf, pdf, gdf)
+out <- out %>% filter(VALUES < th)
+
+insplt <- ggplot(out) +
+  geom_boxplot(aes(x = CAT, y = VALUES, fill = CAT)) +
+  project_theme +
+  scale_fill_manual(values = c("purple", "orange", "dark green")) +
+  labs(fill = "", 
+       y = label,
+       x = "") +
+    theme(axis.text.x = element_blank())
+
+return(insplt)
+  
+}
+
+insplt <- make_comp_plot(ins, "Insurance ($/acre)", th = 80)
+gvtplt <- make_comp_plot(gvt, "Government receipts ($/acre)", th = 50)
+chemplt <- make_comp_plot(chem, "Chemical expenditures ($/acre)", th = 150)
+fertplt <- make_comp_plot(fert, "Fertilizer expenditures ($/acre)", th = 150)
+
+library(ggpubr)
+plt <- ggarrange(insplt, gvtplt, chemplt, fertplt, 
+          labels = c("A.", "B.", "C.", "D."), ncol = 2, nrow = 2, common.legend = T, legend = "right")
+ggsave("./figs/cat_comp_attr.png", plt, width = 8, height = 6)
+```
+
+
+
+
+# SI Figures
+
+# Figure ###: Predictor maps
+
+```{r}
+library(ggpubr)
+geom <- st_geometry(census_sf)
+low = "dark red"
+high = "dark blue"
+
+census_sfs <- census_sf
+st_geometry(census_sfs) <- NULL
+census_sfs <- data.frame(scale(census_sfs %>% select(-c(GEOID))))
+st_geometry(census_sfs) <- census_sf$geometry
+
+census_sfs$chem[census_sfs$chem > 10] <- 10
+chem <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = chem), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Chemicals ($/acre)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+census_sfs$fert[census_sfs$fert > 10] <- 10
+fert <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = fert), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Fertilizer ($/acre)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+census_sfs$labor_expense[census_sfs$labor_expense > 10] <- 10
+labor <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = labor_expense), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Labor ($/acre)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+census_sfs$machinery[census_sfs$machinery > 10] <- 10
+mach <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = machinery), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Machinery ($/acre)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+income <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = income), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Income ($/operation)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+
+gvt <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = gvt_prog), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Government programs ($/acre)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+
+insurance <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = insur_acres), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Insurance ($/acre)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+exp <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = insur_acres), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Experience (years/operation)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+occup <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = insur_acres), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Primary occupation (% operators)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+tenant <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = tenant), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Farmer tenants (% operators)") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+size <- ggplot() +
+  geom_sf(data = census_sfs, aes(fill = acres_per_op), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  project_theme +
+  labs(fill = "",
+       title = "Acres per operation") +
+  scale_fill_gradient2(low = low, mid = "white", high = high)
+
+inputs <- ggarrange(chem, fert, labor, mach, nrow = 2, ncol = 2)
+ggsave("./figs/input_maps.png", plot = inputs, width = 10, height = 10)
+res <- ggarrange(income, insurance, gvt, nrow = 2, ncol = 2)
+ggsave("./figs/resource_maps.png", plot = res, width = 10, height = 10)
+char <- ggarrange(exp, occup, tenant, size, nrow=2, ncol = 2)
+ggsave("./figs/characteristic_maps.png", plot = char, width = 10, height = 10)
+
+```
+
+Irrigation:
+
+```{r}
+mirad_list <- Sys.glob("C:/Users/eburchf/OneDrive - Emory University/Data/MIRAD/mirad1km*.tif")
+mirad <- stack(mirad_list)
+m <- mirad[[4]]
+
+roi_p <- st_transform(roi, mirad@crs)
+m <- raster::crop(m, roi_p)
+m <- raster::mask(m, roi_p)
+state_p <- st_transform(states, m@crs)
+state_p <- as(state_p, "Spatial")
+
+coul2 <- colorRampPalette(brewer.pal(11, "BuPu"))
+
+plt <- levelplot(m, margin = F,
+                 xlab = "",
+                 ylab = "",
+                 scales = list(draw=F),
+                 col.regions = coul2) +
+    latticeExtra::layer(sp.polygons(state_p, lwd = 0.7, col = "#696969"))
+plt
+
+g <- grid.arrange(plt, ncol=1, nrow=1)
+ggsave("./figs/irr_extent.png", g, width=8, height=8)
+
+```
+
+
+# Figure ###: Extent
+
+```{r}
+clim_ras <- stack(Sys.glob("./out/hist_error/extent*.tif")) # no tha is 0.5, K is kappa
+clim_ras <- stack(clim_ras[[2]], clim_ras[[3]], clim_ras[[5]], clim_ras[[7]], clim_ras[[1]], clim_ras[[4]])
+clim_ras[clim_ras == 0] <- NA
+# clim_ras[clim_ras > 0] <- 1
+names(clim_ras) <- clean_crop_names[!(clean_crop_names %in% "Spring wheat")]
+
+# coul2 <- c("white", "dark green")
+coul2 <- colorRampPalette(brewer.pal(11, "Greens"))
+state_sp <- as(st_transform(states, clim_ras@crs), "Spatial")
+
+mytheme = BTCTheme()
+mytheme$panel.background$col = "light grey"
+
+error_viz <- levelplot(clim_ras, 
+                      margin = F,
+                      xlab = "",
+                      ylab = "",
+                      names.attr = names(clim_ras),
+                      # colorkey=F,
+                      layout = c(3,2),
+                      #  ylab=list(c("SSP585", "SSP245"), space = "top"),  # winter wheat
+                      # xlab=list(c("2000-2020", "2041-2060", "2061-2080", "2081-2100"), rot=0),
+                      scales = list(draw=F),
+                      col.regions = terrain.colors(20),
+                      #par.settings = mytheme,
+                      at = seq(0, 100, length.out = 20)) +
+                      #  layout = c(4, 2), 
+                      # names.attr = rep("", dim(allvis)[3]),
+      layer(sp.polygons(state_sp, lwd = 0.7, col = "#696969"))
+
+
+g1 <- grid.arrange(error_viz, ncol=1, nrow=1)
+ggsave("./figs/extent.png", g1, width=8, height=8)
+
+
+```
+
+
+# Figure ###: RMA payments
+
+
+RMA payments:
+
+```{r}
+# cor(apmc$AP, apmc$insur_acres)
+
+#apmc %>%
+#  group_by(AP) %>%
+#  summarize(mn = mean(insur_acres))
+
+col <- readRDS("C:/Users/eburchf/OneDrive - Emory University/WF/RMA/out/COL.RDS")
+# acreage
+
+
+cs <- col %>% 
+  filter(Year %in% c(2000:2020)) %>%
+  group_by(GEOID) %>%
+  summarize(nla = sum(NetLostAcres, na.rm=T),
+            npa = sum(NetPlantedAcres, na.rm=T),
+            pl = nla/npa) %>%
+  group_by(GEOID) %>%
+  summarize(m = mean(pl, na.rm=T))
+
+
+ctym <- merge(counties, cs, by = "GEOID")
+ctym$m[ctym$m > 1.25] <- 1.25
+
+p <- ggplot() +
+  geom_sf(data = ctym, aes(fill = m), color = "transparent") +
+  geom_sf(data = states, fill = NA, color = "black") +
+  theme_minimal() +
+  scale_fill_gradient(low = "white", high = "dark red", na.value = "gray") +
+  scale_y_continuous(labels = comma)
+
+ggsave("./figs/rma_avg_loss.png", p)
+
+```
+
+# Figure ###: Future FRR box and whisker
+
+```{r eval=F}
+# build data
+names <- c("Alfalfa", "Corn", "Cotton", "Hay", "Soy", "Spring wheat", "Winter wheat")
+hs <- stack(Sys.glob("./out/hist_grids/prob*_BIO_WC.tif"))
+# hs[is.na(hs)] <- 0 # in fill water with zero, but check this
+names(hs) <- names
+hs <- dropLayer(hs, "Spring.wheat")  
+  
+state_sp <- as(states, "Spatial")
+state_sp <- spTransform(state_sp, hs@crs)
+
+ssp2 <- build_ensemble_figure(ssp = "245") # write out figs
+ssp3 <- build_ensemble_figure(ssp = "370")
+ssp5 <- build_ensemble_figure(ssp = "585")
+
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "Biophysical")
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "All predictors")
+
+r2 <- ssp2[[2]]
+r3 <- ssp3[[2]]
+r5 <- ssp5[[2]]
+
+hum <- hv_full[[2]] - hv_clim[[2]]
+hum <- stack(hum[[5]], hum[[1]], hum[[2]], hum[[6]], hum[[3]], hum[[4]])
+hum <- stack(hum, hum, hum, hum, hum)
+
+frr_prj <- st_transform(frr, r2@crs) # could change to state
+
+extract_suit(r2,ssp = "245")
+extract_suit(r3, ssp = "370")
+extract_suit(r5, ssp = "585")
+
+r2h <- r2 + hum
+r3h <- r3 + hum
+r5h <- r5 + hum
+
+extract_suit(r2h,ssp = "245H")
+extract_suit(r3h, ssp = "370H")
+extract_suit(r5h, ssp = "585H")
+
+```
+
+Box and whisker through time by crop/FRR:
+
+```{r eval=F}
+r2 <- readRDS("./out/future_suit/ssp_245.RDS")
+r3 <- readRDS("./out/future_suit/ssp_370.RDS")
+r5 <- readRDS("./out/future_suit/ssp_585.RDS")
+
+r2h <- readRDS("./out/future_suit/ssp_245H.RDS")
+r3h <- readRDS("./out/future_suit/ssp_370H.RDS")
+r5h <- readRDS("./out/future_suit/ssp_585H.RDS")
+
+fs <- rbind.data.frame(r2, r3, r5, r2h, r3h, r5h)
+fs$SSP[fs$SSP == "SSP245"] <- "245"
+
+# add FRR names
+# frr_names <- st_read("./data/FRR.shp")
+fs$FRR <- NA
+fs$FRR[fs$ID == 1] <- "Heartland"
+fs$FRR[fs$ID == 2] <- "Northern Crescent"
+fs$FRR[fs$ID == 3] <- "Northern Great Plains"
+fs$FRR[fs$ID == 4] <- "Prarie Gateway"
+fs$FRR[fs$ID == 5] <- "Eastern Uplands"
+fs$FRR[fs$ID == 6] <- "Southern Seaboard"
+fs$FRR[fs$ID == 7] <- "Fruitful Rim"
+fs$FRR[fs$ID == 8] <- "Basin and Range"
+fs$FRR[fs$ID == 9] <- "Mississippi Portal"
+
+fs$FRR <- as.factor(fs$FRR)
+fs$YEAR <- as.factor(fs$YEAR)
+
+fs$YEAR <- factor(fs$YEAR, levels = c("2000-2020", "2021-2040", "2041-2060", "2061-2080", "2081-2100"), 
+                      ordered = T)
+
+fs <- fs %>% na.omit()
+
+saveRDS(fs, "./out/future_suit/all_suit.RDS")
+
+```
+
+YOU ARE HERE!! what can yuo visualize with this.
+
+```{r}
+fs <- readRDS("./out/future_suit/all_suit.RDS")
+fs$YEARN <- NA
+fs$YEARN[fs$YEAR == "2000-2020"] <- 2010
+fs$YEARN[fs$YEAR == "2021-2040"] <- 2030
+fs$YEARN[fs$YEAR == "2041-2060"] <- 2050
+fs$YEARN[fs$YEAR == "2061-2080"] <- 2070
+fs$YEARN[fs$YEAR == "2081-2100"] <- 2090
+
+# line plot by region through time
+corn <- fs %>% filter(CROP == "Corn", SSP %in% c("245", "370", "585")) %>%
+  group_by(FRR, SSP, YEARN) %>%
+  summarize(SUIT = mean(SUITABILITY, na.rm=T))
+
+ggplot(corn) +
+  geom_line(aes(x = YEARN, y = SUIT, color = interaction(SSP, FRR))) +
+  project_theme +
+  ylim(c(0,1))
+
+
+
+fs %>% filter(CROP == "Soy", SSP == "585") %>%
+  group_by(YEAR, FRR) %>%
+  summarize(mn = mean(SUITABILITY),
+            high = mean(SUITABILITY) + sd(SUITABILITY),
+            low = mean(SUITABILITY) - sd(SUITABILITY)) %>%
+  ggplot(., aes(x = YEAR, y = mn, color = FRR, group = FRR)) +
+  geom_errorbar(aes(ymin = low, ymax = high), width = .1) +
+  geom_line(position = pd) +
+  geom_point(position = pd) +
+  project_theme
+
+
+
+
+```
+
+## Table ###: Excluded counties
+
+```{r}
+ex <- counties %>% filter(!GEOID %in% unique(census_sf$GEOID))
+st_geometry(ex) <- NULL
+
+ex <- merge(ex, states, by.x = "STATEFP", by.y = "STATE_FIPS")
+
+ex <- ex %>% select(NAME, STATE_NAME, GEOID)
+```
+
+# HEGS/DISES cat figure
+
+```{r}
+future_cat_viz_corn <- function(ssp = "585", th = bio_th_k) {
+  
+  names <- c("Alfalfa 2021-2040", "Alfalfa 2041-2060", "Alfalfa 2061-2080", "Alfalfa 2081-2100", 
+             "Corn 2021-2040", "Corn 2041-2060", "Corn 2061-2080", "Corn 2081-2100", 
+             "Cotton 2021-2040", "Cotton 2041-2060", "Cotton 2061-2080", "Cotton 2081-2100", 
+             "Hay 2021-2040", "Hay 2041-2060", "Hay 2061-2080", "Hay 2081-2100", 
+             "Soy 2021-2040", "Soy 2041-2060", "Soy 2061-2080", "Soy 2081-2100", 
+             "Wheat 2021-2040", "Wheat 2041-2060", "Wheat 2061-2080", "Wheat 2081-2100") 
+  
+  all_mean <- stack(Sys.glob(paste0("./out/future_ens/mean_stack_", ssp, "*.tif")))
+  names(all_mean) <- names
+  
+  hs <- stack(Sys.glob("./out/hist_grids/prob_*_FULL_DayMet.tif")) 
+  hs <- dropLayer(hs, "prob_SWHEAT_FULL_DayMet") 
+  
+  hsf <- stack(stack(replicate(4, hs[[1]])), stack(replicate(4, hs[[2]])), stack(replicate(4, hs[[3]])), stack(replicate(4, hs[[4]])), 
+               stack(replicate(4, hs[[5]])), stack(replicate(4, hs[[6]])))
+  names(hsf) <- names
+
+  sras <- stack()
+  
+  for (i in 1:dim(all_mean)[[3]]) {
+    
+    print(names[[i]])
+    
+    # pull crop specific th
+    cn <- strsplit(names[[i]], " ")[[1]][1]
+    ths <- th %>% dplyr::filter(CCROP == cn) %>% pull(TH)
+    
+    hist <- hsf[[i]]
+    fut <- all_mean[[i]]
+    
+    hist[hist >= ths] <- 1
+    hist[hist < ths] <- 0
+    
+    fut[fut >= ths] <- 11
+    fut[fut < ths] <- 0
+    
+    # 11-1 = 10 remains suitable
+    # 11-0 = 11 becomes suitable
+    # 0-1 = -1 becomes unsuitable
+    # 0-0 = 0 remains unsuitable
+
+    r <- fut - hist
+    r <- ratify(r)
+    # rat <- levels(r)[[1]]
+    rat <- data.frame(ID = c(-1, 0, 10, 11))
+    
+    rat$TYPE <- NA
+    rat$TYPE[rat$ID == -1] <- "Becomes unsuitable" #red
+    rat$TYPE[rat$ID == 0] <- "Remains unsuitable" # gray
+    rat$TYPE[rat$ID == 10] <- "Remains suitable" # green
+    rat$TYPE[rat$ID == 11] <- "Becomes suitable" # blue
+    
+    levels(r) <- rat
+    sras <- stack(sras, r)
+    
+  }
+  
+  names(sras) <- names
+  cols <- c("orange", "light gray", "#228B22", "purple")
+  
+  state_sp <- as(st_transform(states, sras@crs), "Spatial")
+  
+  sras_sub <- subset(sras, c("Corn.2021.2040", "Corn.2041.2060", "Corn.2061.2080", "Corn.2081.2100"))
+  
+  fcat_viz <- levelplot(sras_sub, 
+                        margin = F,
+                        xlab = list(c("2021-2040", "2041-2060", "2061-2080", "2081-2100"), space = "top"),
+                        ylab="", 
+                        scales = list(draw=F), 
+                        layout = c(4, 1), 
+                        names.attr = rep("", dim(sras_sub)[3]),
+                        colorkey = T,
+                        col.regions = cols) +
+    layer(sp.polygons(state_sp, lwd = 0.7, col = "black"))
+
+  return(fcat_viz)
+  
+  
+}
+
+future_cat_viz_ppl_corn <- function(ssp = "585", th = full_th_k, diff_ras) {
+  
+  # add human impact to climate projections (difference in historical)
+  # and compare to the suitability projected by the full historical models
+  
+  names <- c("Alfalfa 2021-2040", "Alfalfa 2041-2060", "Alfalfa 2061-2080", "Alfalfa 2081-2100", 
+             "Corn 2021-2040", "Corn 2041-2060", "Corn 2061-2080", "Corn 2081-2100", 
+             "Cotton 2021-2040", "Cotton 2041-2060", "Cotton 2061-2080", "Cotton 2081-2100", 
+             "Hay 2021-2040", "Hay 2041-2060", "Hay 2061-2080", "Hay 2081-2100", 
+             "Soy 2021-2040", "Soy 2041-2060", "Soy 2061-2080", "Soy 2081-2100", 
+             "Wheat 2021-2040", "Wheat 2041-2060", "Wheat 2061-2080", "Wheat 2081-2100") 
+  
+  all_mean <- stack(Sys.glob(paste0("./out/future_ens/mean_stack_", ssp, "*.tif")))
+  names(all_mean) <- names
+  
+  hs <- diff_ras
+  all_diff <- stack(stack(replicate(4, hs[[1]])), stack(replicate(4, hs[[2]])), stack(replicate(4, hs[[3]])), stack(replicate(4, hs[[4]])), 
+                    stack(replicate(4, hs[[5]])), stack(replicate(4, hs[[6]])))
+  names(all_diff) <- names
+  
+  all_mean <- all_mean + all_diff # this adds the human influence surface for each crop
+  
+  hs <- stack(Sys.glob("./out/hist_grids/prob_*_FULL_DayMet.tif")) # try WC and DayMet
+  hs <- dropLayer(hs, "prob_SWHEAT_FULL_DayMet")
+  
+  hsf <- stack(stack(replicate(4, hs[[1]])), stack(replicate(4, hs[[2]])), stack(replicate(4, hs[[3]])), stack(replicate(4, hs[[4]])), 
+               stack(replicate(4, hs[[5]])), stack(replicate(4, hs[[6]])))
+  names(hsf) <- names
+  
+  sras <- stack()
+  
+  for (i in 1:dim(all_mean)[[3]]) {
+    
+    print(names[[i]])
+    
+    # pull crop specific th
+    cn <- strsplit(names[[i]], " ")[[1]][1]
+    ths <- th %>% filter(CCROP == cn) %>% pull(TH)
+    
+    hist <- hsf[[i]]
+    fut <- all_mean[[i]]
+    
+    hist[hist >= ths] <- 1
+    hist[hist < ths] <- 0
+    
+    fut[fut >= ths] <- 11
+    fut[fut < ths] <- 0
+    
+    # 11-1 = 10 remains suitable
+    # 11-0 = 11 becomes suitable
+    # 0-1 = -1 becomes unsuitable
+    # 0-0 = 0 remains unsuitable
+    
+    r <- fut - hist
+    r <- ratify(r)
+    # rat <- levels(r)[[1]]
+    rat <- data.frame(ID = c(-1, 0, 10, 11))
+    
+    rat$TYPE <- NA
+    rat$TYPE[rat$ID == -1] <- "Becomes unsuitable" #red
+    rat$TYPE[rat$ID == 0] <- "Remains unsuitable" # gray
+    rat$TYPE[rat$ID == 10] <- "Remains suitable" # green
+    rat$TYPE[rat$ID == 11] <- "Becomes suitable" # blue
+    
+    levels(r) <- rat
+    sras <- stack(sras, r)
+    
+  }
+  
+  names(sras) <- names
+  
+  cols <- c("orange", "light gray", "#228B22", "purple")
+  
+  state_sp <- as(st_transform(states, sras@crs), "Spatial")
+  
+  sras_sub <- subset(sras, c("Corn.2021.2040", "Corn.2041.2060", "Corn.2061.2080", "Corn.2081.2100"))
+  
+  fcat_viz <- levelplot(sras_sub, 
+                        margin = F,
+                        xlab = list(c("2021-2040", "2041-2060", "2061-2080", "2081-2100"), space = "top"),  # winter wheat
+                        ylab="", 
+                        scales = list(draw=F), 
+                        layout = c(4, 1), 
+                        names.attr = rep("", dim(sras_sub)[3]),
+                        colorkey = T,
+                        col.regions = cols) +
+    layer(sp.polygons(state_sp, lwd = 0.7, col = "black"))
+
+  return(fcat_viz)
+  
+  
+  
+}
+
+```
+
+```{r}
+full_th_k <- find_threshold("_FULL.RDS", index = "Accuracy")
+bio_th_k <- find_threshold("_BIO.RDS", index = "Accuracy")
+full_th_k$TH < 0.4
+bio_th_k$TH <- 0.4
+
+# full_th_k$TH <- 0.4
+
+out_ext <- "_BIO.RDS"
+hv_clim <- build_hist_vis(out_ext, yl = "Biophysical", ds = "_DayMet")
+
+out_ext <- "_FULL.RDS"
+hv_full <- build_hist_vis(out_ext, yl = "All predictors", ds = "_DayMet")
+
+diff_ras <- hv_full[[2]] - hv_clim[[2]]
+
+hviz <- future_cat_viz_corn(ssp = "370", th = bio_th_k)
+fviz <- future_cat_viz_ppl_corn(ssp = "370", th = full_th_k, diff_ras = diff_ras) 
+
+ggarrange(hviz, fviz, ncol = 1, nrow = 2, labels = c("A. Biophysical Projections", "B. Agricultural Projections"),
+          font.label = list(size = 8))
+ggsave("./figs/hegs4.png", width = 11, height = 5)
+```
+
+# SI Figure 20
+
+```{r}
+df <- readRDS("C:/Users/eburchf/OneDrive - Emory University/Data/BSDS_standatt_operated_v3.RDS") %>%
+  select(GEOID, year, fert, chem, labor_expense, machinery, income, gvt_prog, insur_acres, exp, occup, tenant, acres_per_op)
+
+dfl <- pivot_longer(df, cols = 3:ncol(df), names_to = "VAR", values_to = "VALUE")
+
+dfg <- dfl %>% group_by(GEOID, VAR) %>%
+  summarize(mn = mean(VALUE, na.rm=T),
+            sd = sd(VALUE, na.rm=T),
+            cov = sd/mn)
+
+dfg$VN <- NA
+dfg$VN[dfg$VAR == "fert"] <- "Fertilizer ($/acre)"
+dfg$VN[dfg$VAR == "chem"] <- "Chemicals ($/acre)"
+dfg$VN[dfg$VAR == "labor_expense"] <- "Labor ($/acre)"
+dfg$VN[dfg$VAR == "machinery"] <- "Machinery ($/acre)"
+dfg$VN[dfg$VAR == "income"] <- "Net cash farm income ($/operation)"
+dfg$VN[dfg$VAR == "gvt_prog"] <- "Government receipts ($/acre)"
+dfg$VN[dfg$VAR == "insur_acres"] <- "Crop insurance (% acreage)"
+dfg$VN[dfg$VAR == "exp"] <- "Years farming"
+dfg$VN[dfg$VAR == "occup"] <- "% primary occupation"
+dfg$VN[dfg$VAR == "tenant"] <- "% tenancy"
+dfg$VN[dfg$VAR == "acres_per_op"] <- "Median farm size"
+
+
+ggplot(dfg) +
+  geom_boxplot(aes(x = reorder(VN, cov), y = cov), alpha = 0.05) +
+  project_theme +
+  coord_flip() +
+  labs(y = "Coefficient of variation",
+       x = "") +
+  ylim(0, 3) +
+  geom_hline(aes(yintercept = 0.5), linetype = "dashed")
+
+ggsave("./figs/cov_coa.png")
+
+# A CV of 0.5 means the standard deviation is half as large as the mean
+
+```
+
+## SI Figure 21
+
+```{r}
+census_sf$fert[census_sf$fert > 200] <- 200
+fert <- ggplot() +
+  geom_sf(data = census_sf, aes(fill = fert), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  scale_fill_continuous(low = "white", high = "dark red", na.value = "light gray") +
+  map_theme +
+  labs(title = "A. Fertilizer",
+       fill = "$/acre") +
+  theme(legend.position = "right")
+
+census_sf$chem[census_sf$chem > 100] <- 100
+chem <- ggplot() +
+  geom_sf(data = census_sf, aes(fill = chem), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  scale_fill_continuous(low = "white", high = "dark red", na.value = "light gray") +
+  map_theme +
+  labs(title = "B. Chemicals",
+       fill = "$/acre") +
+  theme(legend.position = "right")
+
+gvt <- ggplot() +
+  geom_sf(data = census_sf, aes(fill = gvt_prog), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  scale_fill_continuous(low = "white", high = "dark blue", na.value = "light gray") +
+  map_theme +
+  labs(title = "C. Government receipts",
+       fill = "$/acre") +
+  theme(legend.position = "right")
+
+ins <- ggplot() +
+  geom_sf(data = census_sf, aes(fill = insur_acres), color = "transparent") +
+  geom_sf(data = states, color = "#A9A9A9", fill = NA, alpha = 0.1) +
+  scale_fill_continuous(low = "white", high = "dark blue", na.value = "light gray") +
+  map_theme +
+  labs(title = "D. Insurance",
+       fill = "$/acre") +
+  theme(legend.position = "right")
+
+library(ggpubr)
+
+ggarrange(fert, chem, gvt, ins, ncol = 2, nrow = 2)
+ggsave("./figs/inputs_gvt.png", width = 10, height = 10)
+
+
+
+```
+
+
+
+
+
+
+
